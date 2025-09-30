@@ -1,0 +1,102 @@
+
+name: ROCTUP-MCP
+services:
+###########################################
+## NEO4J Database
+###########################################
+  1c-neo4j:
+    image: neo4j:latest    
+    restart: unless-stopped
+    ports:
+      - "7474:7474"   # Neo4j Browser (optional)
+      - "7687:7687"   # Bolt
+    volumes:
+      - 1c_neo4j_data:/data
+    environment:
+      - NEO4J_AUTH=neo4j/${NEO4J_PASSWORD}
+      - NEO4J_client_allow__telemetry=false
+      - NEO4J_dbms_memory_transaction_total_max=4096m
+      - NEO4J_db_transaction_timeout=300s
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -a bolt://localhost:7687 -u neo4j -p \"${NEO4J_PASSWORD}\" 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+###########################################
+## Project1
+###########################################
+  1c-metacode-prj1:
+    image: roctup/1c-mcp-metacode
+    restart: unless-stopped
+    ports:
+      - "6001:6001"  # MCP server (project 1)
+    # Host ./data/prj1 -> container /app/data with:
+    #   - metadata: ./data/prj1/metadata
+    #   - code:     ./data/prj1/code
+    volumes:
+      - ./data/prj1:/app/data # use relative path binding or full path binding - E:\1C\MCP\Accounting\data:/app/data    
+    environment:
+    # Project identity (unique per app)
+      - PROJECT_NAME=Accounting
+    # Shared Neo4j DB     
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      - NEO4J_URI=bolt://1c-neo4j:7687      
+    # OpenAI / LLM
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE}
+      - OPENAI_MODEL=${OPENAI_MODEL}
+    # MCP server      
+      - MCP_USE_SSE=${MCP_USE_SSE}
+    # Load toggles (per app). Note: FULL_METADATA_RELOAD=true clears ONLY the current PROJECT_NAME data (project-scoped), not the entire DB.
+      - FULL_METADATA_RELOAD=false
+      - LOAD_PREDEFINED_VALUES=${LOAD_PREDEFINED_VALUES:-true}
+      - LOAD_FORMS_FROM_XML=${LOAD_FORMS_FROM_XML:-true}
+      - LOAD_ROLE_RIGHTS=${LOAD_ROLE_RIGHTS:-true}
+    # Template/LLM mode
+      - TEMPLATE_MODE_ENABLED=${TEMPLATE_MODE_ENABLED:-true}
+      - TEMPLATE_MODE_ONLY=${TEMPLATE_MODE_ONLY:-true}  
+    depends_on:
+      1c-neo4j:
+        condition: service_healthy
+
+###########################################
+## Project2
+###########################################
+  1c-metacode-prj2:
+    image: roctup/1c-mcp-metacode
+    restart: unless-stopped
+    ports:
+      - "6011:6001"  # MCP server (project 2) -> host:6011
+    # Host ./data/prj2 -> container /app/data with:
+    #   - metadata: ./data/prj2/metadata
+    #   - code:     ./data/prj2/code
+    volumes:
+      - ./data/prj2:/app/data  # use relative path binding or full path binding full path binding - E:\1C\MCP\HRM\data:/app/data
+    environment:
+    # Project identity (unique per app)
+      - PROJECT_NAME=HRM
+    # Shared Neo4j DB     
+      - NEO4J_PASSWORD=${NEO4J_PASSWORD}
+      - NEO4J_URI=bolt://1c-neo4j:7687      
+    # OpenAI / LLM
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE}
+      - OPENAI_MODEL=${OPENAI_MODEL}
+    # MCP server      
+      - MCP_USE_SSE=${MCP_USE_SSE}
+    # Load toggles (per app). Note: FULL_METADATA_RELOAD=true clears ONLY the current PROJECT_NAME data (project-scoped), not the entire DB.
+      - FULL_METADATA_RELOAD=false
+      - LOAD_PREDEFINED_VALUES=${LOAD_PREDEFINED_VALUES:-true}
+      - LOAD_FORMS_FROM_XML=${LOAD_FORMS_FROM_XML:-true}
+      - LOAD_ROLE_RIGHTS=${LOAD_ROLE_RIGHTS-true}
+    # Template/LLM mode
+      - TEMPLATE_MODE_ENABLED=${TEMPLATE_MODE_ENABLED:-true}
+      - TEMPLATE_MODE_ONLY=${TEMPLATE_MODE_ONLY:-true}
+    depends_on:
+      1c-neo4j:
+        condition: service_healthy
+
+volumes:
+  1c_neo4j_data:
+    driver: local
