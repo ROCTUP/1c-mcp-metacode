@@ -4,13 +4,15 @@
 
 #### Основные возможности
 
-- Загрузка всех метаданных конфигураций 1С в графовую базу Neo4j из отчета по конфигурации 
-- Загрузка данных управляемых форм - реквизиты/элементы формы.
+- Загрузка всех метаданных конфигураций 1С в графовую базу Neo4j из отчета по конфигурации. 
+- Загрузка данных управляемых форм - реквизиты, элементы формы, события, команды. Привязка событий форм и элементов, команд к обработчикам.
 - Загрузка предопределенных значений и прав ролей.
+- Загрузка подписок на события и привязка к обработчикам.
+- Загрузка сигнатур процедур/функций из всех модулей, формирование графа вызовов.
 - Широкая связность объектов метаданных: в реквизитах, в элементах управлениях формы, в регистрах накопления/сведений, в правах доступа. 
 - MCP инструменты: search_metadata
 - Поддержка загрузки и поиска информации по несколким конфигурациям (проектам). При поиске не нужно указывать в каком проекте искать. Система автоматически фильтрует. 
-- Возможность осуществлять поиск как с помощью LLM (режим агента, который переводить запрос на естественом языке в cypher запрос), так и без LLM (поиск по шаблонам). Большинство информации может быть найдено по шаблонам. 
+- Возможность осуществлять поиск как с помощью LLM (режим агента, который переводить запрос на естественом языке в cypher запрос), так и без LLM (поиск по шаблонам). Возможен так же гибридный режим. Большинство информации может быть найдено по шаблонам. 
 
 
 #### Структура данных
@@ -60,52 +62,83 @@ graph TB
     FormControl -->|"BINDS_TO"| BindTarget(["Bind Target<br/>Цель связывания"])
     FormControl -->|"LINKS_TO_COMMAND"| LinkedCommand(["Command<br/>Команда"])
     
-    %% Стили с уникальными цветами
+    %% Новые добавления: дополнительные сущности и связи
+    MetadataObject -->|"HAS_LAYOUT"| Layout(["Layout<br/>Макет"])
+    MetadataObject -->|"HAS_CHARACTERISTIC"| Characteristic(["Characteristic<br/>Характеристика"])
+    MetadataObject -->|"HAS_ENUM_VALUE"| EnumValue(["EnumValue<br/>ЗначениеПеречисления"])
+    MetadataObject -->|"HAS_GRAPH"| JournalGraph(["JournalGraph<br/>Граф журнала"])
+    MetadataObject -->|"HAS_ACCOUNTING_FLAG"| AccountingFlag(["AccountingFlag<br/>ПризнакУчета"])
+    MetadataObject -->|"HAS_DIMENSION_ACCOUNTING_FLAG"| DimensionAccountingFlag(["DimensionAccountingFlag<br/>ПризнакУчетаСубконто"])
+    MetadataObject -->|"CONTAINS_OBJECT"| SubsystemChild(["MetadataObject<br/>Дочерний объект<br/>(подсистемы)"])
+    PredefinedItem -->|"HAS_CHILD"| PredefinedChild(["PredefinedItem<br/>Дочерний элемент"])
+    FormControl -->|"HAS_CHILD"| FormControlChild(["FormControl<br/>Дочерний элемент"])
+    Form -->|"HAS_COMMAND"| FormCommand(["Command<br/>Команда формы"])
+    EventSubscription -->|"HAS_HANDLER"| EventSubHandler(["Routine<br/>Обработчик подписки"])
+    Command -->|"HAS_HANDLER"| CommandHandler(["Routine<br/>Обработчик команды"])
+    FormCommand -->|"HAS_HANDLER"| FormCommandHandler(["Routine<br/>Обработчик команды формы"])
+    
+    %% Уникальные стили для каждого типа узла (упрощено, без лишних подтипов)
     classDef projectClass fill:#FF6B6B,stroke:#C92A2A,stroke-width:2px,color:#FFFFFF
     classDef configClass fill:#4ECDC4,stroke:#26A69A,stroke-width:2px,color:#FFFFFF
     classDef categoryClass fill:#45B7D1,stroke:#1976D2,stroke-width:2px,color:#FFFFFF
     classDef objectClass fill:#96CEB4,stroke:#388E3C,stroke-width:2px,color:#FFFFFF
     classDef formClass fill:#FFEAA7,stroke:#FD8D3C,stroke-width:2px,color:#000000
-    classDef commandClass fill:#DDA0DD,stroke:#7B68EE,stroke-width:2px,color:#FFFFFF
-    classDef moduleClass fill:#98D8C8,stroke:#16A085,stroke-width:2px,color:#FFFFFF
-    classDef tabularClass fill:#F7DC6F,stroke:#F39C12,stroke-width:2px,color:#000000
-    classDef predefinedClass fill:#BB8FCE,stroke:#8E44AD,stroke-width:2px,color:#FFFFFF
+    classDef formControlClass fill:#AED6F1,stroke:#3498DB,stroke-width:2px,color:#FFFFFF
+    classDef formEventClass fill:#FF69B4,stroke:#C2185B,stroke-width:2px,color:#FFFFFF
+    classDef formAttrClass fill:#A3E4D7,stroke:#1ABC9C,stroke-width:2px,color:#000000
     classDef attributeClass fill:#85C1E9,stroke:#2980B9,stroke-width:2px,color:#FFFFFF
+    classDef tabularClass fill:#F7DC6F,stroke:#F39C12,stroke-width:2px,color:#000000
     classDef resourceClass fill:#F8C471,stroke:#E67E22,stroke-width:2px,color:#000000
     classDef dimensionClass fill:#82E0AA,stroke:#27AE60,stroke-width:2px,color:#FFFFFF
+    classDef targetClass fill:#CACFD2,stroke:#7F8C8D,stroke-width:2px,color:#000000
+    classDef moduleClass fill:#98D8C8,stroke:#16A085,stroke-width:2px,color:#FFFFFF
     classDef routineClass fill:#F1948A,stroke:#E74C3C,stroke-width:2px,color:#FFFFFF
-    classDef formControlClass fill:#AED6F1,stroke:#3498DB,stroke-width:2px,color:#FFFFFF
-    classDef formEventClass fill:#D7BDE2,stroke:#8E44AD,stroke-width:2px,color:#FFFFFF
-    classDef formAttrClass fill:#A3E4D7,stroke:#1ABC9C,stroke-width:2px,color:#000000
+    classDef commandClass fill:#E1BEE7,stroke:#9C27B0,stroke-width:2px,color:#FFFFFF
     classDef urlTemplateClass fill:#F9E79F,stroke:#F1C40F,stroke-width:2px,color:#000000
     classDef urlMethodClass fill:#D98880,stroke:#CD6155,stroke-width:2px,color:#FFFFFF
     classDef eventSubClass fill:#AEB6BF,stroke:#5D6D7E,stroke-width:2px,color:#FFFFFF
-    classDef targetClass fill:#CACFD2,stroke:#7F8C8D,stroke-width:2px,color:#000000
+    classDef predefinedClass fill:#BB8FCE,stroke:#8E44AD,stroke-width:2px,color:#FFFFFF
+    classDef bindTargetClass fill:#D5DBDB,stroke:#BDC3C7,stroke-width:2px,color:#000000
+    classDef layoutClass fill:#F0E68C,stroke:#DAA520,stroke-width:2px,color:#000000
+    classDef characteristicClass fill:#DEB887,stroke:#CD853F,stroke-width:2px,color:#000000
+    classDef enumValueClass fill:#FFA07A,stroke:#FF6347,stroke-width:2px,color:#FFFFFF
+    classDef journalGraphClass fill:#20B2AA,stroke:#008B8B,stroke-width:2px,color:#FFFFFF
+    classDef accountingFlagClass fill:#87CEEB,stroke:#4682B4,stroke-width:2px,color:#FFFFFF
+    classDef dimensionAccountingFlagClass fill:#DDA0DD,stroke:#BA55D3,stroke-width:2px,color:#FFFFFF
+    classDef subsystemChildClass fill:#A8E6CF,stroke:#3D9970,stroke-width:2px,color:#FFFFFF
+    classDef formControlChildClass fill:#B3E5FC,stroke:#03A9F4,stroke-width:2px,color:#FFFFFF
+    classDef tabularAttributeClass fill:#90CAF9,stroke:#2196F3,stroke-width:2px,color:#FFFFFF
     
-    %% Применение цветов
+    %% Применение цветов (упрощено)
     class Project projectClass
     class Configuration configClass
     class MetadataCategory categoryClass
-    class MetadataObject objectClass
-    class Form,FormAttribute formClass
-    class Command commandClass
-    class Module moduleClass
+    class MetadataObject,SubsystemChild subsystemChildClass
+    class Form formClass
+    class FormControl,FormControlChild formControlChildClass
+    class FormEvent formEventClass
+    class FormAttribute formAttrClass
+    class Attribute,TabularAttribute tabularAttributeClass
     class TabularPart tabularClass
-    class PredefinedItem predefinedClass
-    class Attribute,TabularAttribute attributeClass
     class Resource resourceClass
     class Dimension dimensionClass
-    class Routine,CalledRoutine,EventHandler,ControlEventHandler,UrlHandler routineClass
-    class FormControl formControlClass
-    class FormEvent,FormControlEvent formEventClass
+    class UsedInTarget,RegisterObject,AccessTarget targetClass
+    class Module moduleClass
+    class Routine,CalledRoutine,EventHandler,ControlEventHandler,UrlHandler,EventSubHandler,CommandHandler,FormCommandHandler routineClass
+    class Command,FormCommand,LinkedCommand commandClass
     class UrlTemplate urlTemplateClass
     class UrlMethod urlMethodClass
     class EventSubscription eventSubClass
-    class UsedInTarget,RegisterObject,AccessTarget,BindTarget,LinkedCommand targetClass
+    class PredefinedItem,PredefinedChild predefinedClass
+    class BindTarget bindTargetClass
+    class Layout layoutClass
+    class Characteristic characteristicClass
+    class EnumValue enumValueClass
+    class JournalGraph journalGraphClass
+    class AccountingFlag accountingFlagClass
+    class DimensionAccountingFlag dimensionAccountingFlagClass
+
 ```
-
-
-Пока не полностью реализована.  Отсутвуют модули и прооцедуры/функции.
 
 
 #### Быстрый старт
@@ -167,8 +200,8 @@ docker compose logs -f 1c-metacode-prj1
 
 - Приложение создаст индексы в Neo4j
 - Проведёт загрузку метаданных из ./data/metadata/*.txt
-- При включённых флагах — просканирует ./data/code и догрузит формы/предопределённые значения/права
-- Загрузка всех данных занимает около 15 минут для типовой конфигурации Бухгалтерия (может увеличиться если слабый компьютер)  
+- При включённых флагах — просканирует ./data/code и догрузит формы, предопределённые значения, права, подписки на события, модули с процедурами и функциями
+- Загрузка всех данных занимает около 50 минут для типовой конфигурации Бухгалтерия (может увеличиться если слабый компьютер)    
 
 #### Обновление/перезагрузка данных
 
@@ -228,6 +261,14 @@ docker compose down --volumes
 docker compose up -d --force-recreate
 ```
 
+#### Changelog
 
+##### v1.1.0 - 2025-10-07
+- Добавлена поддержка загрузки подписок на события
+- Добавлена поддержка загрузки модулей с процедурами/функциями и формирования графа вызовов
+
+##### v1.0.0 - 2025-09-30
+- Первоначальный релиз с загрузкой метаданных 1С в Neo4j
+- Поддержка MCP инструментов для поиска метаданных
 
 
