@@ -32,9 +32,23 @@ services:
     restart: unless-stopped
     ports:
       - "6001:6001"  # MCP server (project 1)
-    # Host ./data/prj1 -> container /app/data with:
-    #   - metadata: ./data/prj1/metadata
-    #   - code:     ./data/prj1/code
+    # Host directories are mounted into the container's /app/data directory.
+    # The application expects to find 'metadata' and an optional 'code' subdirectory.
+    #
+    # Example 1: Single project directory from host
+    #   ./data/prj1/metadata -> /app/data/metadata
+    #   ./data/prj1/code     -> /app/data/code
+    #
+    # volumes:
+    #   - ./data/prj1:/app/data
+    #
+    # Example 2: Separate host directories for metadata and code 
+    #   D:\metadata\prj1 -> /app/data/metadata
+    #   E:\sources\prj1  -> /app/data/code
+    #
+    # volumes:
+    #   - D:\metadata\prj1:/app/data/metadata
+    #   - E:\sources\prj1:/app/data/code
     volumes:
       - ./data/prj1:/app/data # use relative path binding or full path binding - E:\1C\MCP\Accounting\data:/app/data    
     environment:
@@ -72,9 +86,23 @@ services:
     restart: unless-stopped
     ports:
       - "6011:6001"  # MCP server (project 2) -> host:6011
-    # Host ./data/prj2 -> container /app/data with:
-    #   - metadata: ./data/prj2/metadata
-    #   - code:     ./data/prj2/code
+    # Host directories are mounted into the container's /app/data directory.
+    # The application expects to find 'metadata' and an optional 'code' subdirectory.
+    #
+    # Example 1: Single project directory from host
+    #   ./data/prj2/metadata -> /app/data/metadata
+    #   ./data/prj2/code     -> /app/data/code
+    #
+    # volumes:
+    #   - ./data/prj2:/app/data
+    #
+    # Example 2: Separate host directories for metadata and code 
+    #   D:\metadata\prj2 -> /app/data/metadata
+    #   E:\sources\prj2  -> /app/data/code
+    #
+    # volumes:
+    #   - D:\metadata\prj2:/app/data/metadata
+    #   - E:\sources\prj2:/app/data/code
     volumes:
       - ./data/prj2:/app/data  # use relative path binding or full path binding full path binding - E:\1C\MCP\HRM\data:/app/data
     environment:
