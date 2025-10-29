@@ -57,10 +57,16 @@ services:
     # Shared Neo4j DB     
       - NEO4J_PASSWORD=${NEO4J_PASSWORD}
       - NEO4J_URI=bolt://1c-neo4j:7687      
-    # OpenAI / LLM
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
+    # OpenAI / LLM      
       - OPENAI_API_BASE=${OPENAI_API_BASE}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - OPENAI_MODEL=${OPENAI_MODEL}
+    # Embedding API
+      - EMBEDDING_API_BASE=${EMBEDDING_API_BASE}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
+      - ENABLE_ROUTINE_DESCRIPTION_EMBEDDING=${ENABLE_ROUTINE_DESCRIPTION_EMBEDDING:-false}
+      - ENABLE_METADATA_DESCRIPTION_EMBEDDING=${ENABLE_METADATA_DESCRIPTION_EMBEDDING:-false}
     # MCP server      
       - MCP_USE_SSE=${MCP_USE_SSE}
     # Load toggles (per app). Note: FULL_METADATA_RELOAD=true clears ONLY the current PROJECT_NAME data (project-scoped), not the entire DB.
@@ -112,9 +118,15 @@ services:
       - NEO4J_PASSWORD=${NEO4J_PASSWORD}
       - NEO4J_URI=bolt://1c-neo4j:7687      
     # OpenAI / LLM
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
       - OPENAI_API_BASE=${OPENAI_API_BASE}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}      
       - OPENAI_MODEL=${OPENAI_MODEL}
+    # Embedding API
+      - EMBEDDING_API_BASE=${EMBEDDING_API_BASE}
+      - EMBEDDING_API_KEY=${EMBEDDING_API_KEY}
+      - EMBEDDING_MODEL=${EMBEDDING_MODEL}
+      - ENABLE_ROUTINE_DESCRIPTION_EMBEDDING=${ENABLE_ROUTINE_DESCRIPTION_EMBEDDING:-false}
+      - ENABLE_METADATA_DESCRIPTION_EMBEDDING=${ENABLE_METADATA_DESCRIPTION_EMBEDDING:-false}
     # MCP server      
       - MCP_USE_SSE=${MCP_USE_SSE}
     # Load toggles (per app). Note: FULL_METADATA_RELOAD=true clears ONLY the current PROJECT_NAME data (project-scoped), not the entire DB.
