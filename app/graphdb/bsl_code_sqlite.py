@@ -900,6 +900,24 @@ class BslCodeSqlite:
             ),
         )
 
+    def count_units_for_config(self, scope: str, config_name: str) -> int:
+        """Count committed code-search units owned by one configuration.
+
+        Used as a removal postcondition before incremental extension state is
+        discarded. Reading only the current epoch avoids false positives from
+        retired epochs that are waiting for normal GC.
+        """
+        epoch = self.get_current_epoch(scope)
+        if epoch is None:
+            return 0
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS cnt FROM bsl_code_units "
+                "WHERE project_name = ? AND index_epoch = ? AND config_name = ?",
+                (scope, int(epoch), config_name),
+            ).fetchone()
+        return int(row["cnt"] if row else 0)
+
     def fts_bm25(
         self,
         scope: str,

@@ -1451,7 +1451,7 @@ class MetadataIncrementalSync:
         Шаги (см. план §5):
         1. extensions_directory не существует → выход.
         2. Top-level diff: scope-ы в state vs фактические каталоги на диске →
-           удалённые получают `_apply_ext_removed` с graph cfg name из state.
+           удалённые регистрируются для deferred purge после artifact/BSL-фаз.
         3. Для каждого фактического `<ext_dir>`:
            - validation структуры (`metadata/` + единственный `.txt`);
            - при failed validation И существующем scope — `_apply_ext_removed`;
@@ -1478,13 +1478,16 @@ class MetadataIncrementalSync:
             ext_graph_config_name = self._extract_ext_cfg_name_from_state(
                 scope, project_name
             )
-            _apply_ext_removed(
-                loader=self.loader,
-                state=self.state,
-                source_scope=scope,
-                project_name=project_name,
-                ext_graph_config_name=ext_graph_config_name,
-            )
+            if ext_graph_config_name:
+                report.removed_extension_scopes[scope] = ext_graph_config_name
+                report.notes.append(
+                    f"extension removal deferred: scope={scope} "
+                    f"config={ext_graph_config_name}"
+                )
+            else:
+                report.errors.append(
+                    f"cannot defer extension removal without config name: scope={scope}"
+                )
 
         # 3. Per-extension.
         for ext_dir in sorted(ext_dirs, key=lambda d: d.name):
@@ -1498,28 +1501,34 @@ class MetadataIncrementalSync:
             # Validation as full load does.
             if not ext_metadata_dir.exists():
                 if scope_exists:
-                    _apply_ext_removed(
-                        loader=self.loader,
-                        state=self.state,
-                        source_scope=source_scope,
-                        project_name=project_name,
-                        ext_graph_config_name=self._extract_ext_cfg_name_from_state(
-                            source_scope, project_name
-                        ),
+                    ext_graph_config_name = self._extract_ext_cfg_name_from_state(
+                        source_scope, project_name
                     )
+                    if ext_graph_config_name:
+                        report.removed_extension_scopes[source_scope] = (
+                            ext_graph_config_name
+                        )
+                    else:
+                        report.errors.append(
+                            f"cannot defer invalid extension removal without "
+                            f"config name: scope={source_scope}"
+                        )
                 continue
             txt_files = list(ext_metadata_dir.glob("*.txt"))
             if not txt_files or len(txt_files) > 1:
                 if scope_exists:
-                    _apply_ext_removed(
-                        loader=self.loader,
-                        state=self.state,
-                        source_scope=source_scope,
-                        project_name=project_name,
-                        ext_graph_config_name=self._extract_ext_cfg_name_from_state(
-                            source_scope, project_name
-                        ),
+                    ext_graph_config_name = self._extract_ext_cfg_name_from_state(
+                        source_scope, project_name
                     )
+                    if ext_graph_config_name:
+                        report.removed_extension_scopes[source_scope] = (
+                            ext_graph_config_name
+                        )
+                    else:
+                        report.errors.append(
+                            f"cannot defer invalid extension removal without "
+                            f"config name: scope={source_scope}"
+                        )
                 continue
             txt_path = txt_files[0]
             rel_path = txt_path.name

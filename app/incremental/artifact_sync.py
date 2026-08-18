@@ -153,6 +153,10 @@ class CodeArtifactCycleContext:
     # Используется post-link consumers и base form impact lookup.
     known_extension_configs: Dict[str, str] = field(default_factory=dict)  # ext_dir -> ext_config_name
 
+    # Phase-1 scopes whose top-level extension directory disappeared.
+    # Kept in state until BSL sidecar cleanup and graph postconditions succeed.
+    removed_extension_scopes: Dict[str, str] = field(default_factory=dict)
+
     # SSL: при изменении подсистем СтандартныеПодсистемы (Состав / ПутьПодсистемы)
     # incremental пайплайн поднимает этот флаг — scheduler после BSL apply
     # запускает loader.refresh_ssl_api_for_project. Scoped refresh для затронутых
@@ -180,6 +184,8 @@ class CodeArtifactCycleContext:
     # `BslCodeSearchSync` сам триггерит full rebuild через reindex_requested.
     bsl_code_search_delta_applier: Any = None
     bsl_code_search_scope: Optional[str] = None
+    bsl_code_search_indexer: Any = None
+    bsl_code_search_sqlite: Any = None
 
     def graph_changed(self) -> bool:
         """True если artifact/BSL-фаза действительно изменила Neo4j-граф в этом цикле.
@@ -946,6 +952,22 @@ class ArtifactSync:
             if extensions_dir is None:
                 continue
             ext_code_dir = extensions_dir / ext_dir_name / "code"
+            if scope in context.removed_extension_scopes:
+                ext_summaries = self._prepare_removed_extension_bsl(
+                    settings_obj=settings_obj,
+                    context=context,
+                    lease=lease,
+                    source_mode=source_mode,
+                    source_scope=scope,
+                    ext_dir_name=ext_dir_name,
+                    ext_config_name=ext_config_name,
+                    ext_code_dir=ext_code_dir,
+                )
+                all_summaries[ext_dir_name] = ext_summaries
+                _log_extension_summary(ext_dir_name, ext_summaries)
+                if lease is not None:
+                    lease.heartbeat()
+                continue
             if not ext_code_dir.exists():
                 continue
 
@@ -1211,6 +1233,135 @@ class ArtifactSync:
                 lease.heartbeat()
 
         return all_summaries
+
+    def _prepare_removed_extension_bsl(
+        self,
+        *,
+        settings_obj: Any,
+        context: CodeArtifactCycleContext,
+        lease: Optional[LockLease],
+        source_mode: str,
+        source_scope: str,
+        ext_dir_name: str,
+        ext_config_name: str,
+        ext_code_dir: Path,
+    ) -> Dict[str, ArtifactSummary]:
+        """Feed every saved BSL file of a removed extension into normal delta cleanup.
+
+        The directory no longer exists, so a regular code-index scan cannot
+        produce ``deleted`` paths. The artifact manifest is the authoritative
+        baseline and remains available because phase 1 only registered the
+        pending removal.
+        """
+        scope_bsl = ext_artifact_scope(source_mode, ext_dir_name, "bsl")
+        # Use both baselines. A partially failed earlier cycle can remove an
+        # artifact_manifest row while retaining bsl_file_artifacts (or vice
+        # versa); the union preserves every routine/module ID available for
+        # cleanup.
+        deleted_path_set = set(
+            self.state.all_artifact_manifest_rel_paths(scope_bsl)
+        )
+        deleted_path_set.update(
+            row["rel_path"]
+            for row in self.state.all_bsl_file_artifacts(scope_bsl)
+            if row.get("rel_path")
+        )
+        deleted_paths = sorted(deleted_path_set)
+        diff = ArtifactDiff(deleted=deleted_paths)
+        context.affected_artifacts[scope_bsl] = diff
+        if deleted_paths:
+            self._apply_bsl(
+                project_name=context.project_name,
+                config_name=ext_config_name,
+                source_scope=scope_bsl,
+                root=ext_code_dir,
+                diff=diff,
+                extra_files_to_parse=[],
+                extras_manifest_scope=ext_artifact_scope(
+                    source_mode, ext_dir_name, "form_bin"
+                ),
+                context=context,
+                settings_obj=settings_obj,
+                lease=lease,
+            )
+        else:
+            logger.warning(
+                "Removed extension has no BSL artifact baseline: scope=%s",
+                source_scope,
+            )
+        return {
+            scope_bsl: ArtifactSummary(deleted=len(deleted_paths)),
+        }
+
+    def finalize_removed_extensions(
+        self,
+        *,
+        settings_obj: Any,
+        context: CodeArtifactCycleContext,
+        report: Any,
+        lease: Optional[LockLease] = None,
+    ) -> int:
+        """Purge graph residue and discard state only after BSL cleanup succeeded."""
+        total_deleted = 0
+        code_search_enabled = bool(
+            getattr(settings_obj, "enable_bsl_code_search", False)
+        )
+        sqlite = context.bsl_code_search_sqlite
+        sqlite_scope = context.bsl_code_search_scope or context.project_name
+
+        for source_scope, config_name in sorted(
+            context.removed_extension_scopes.items()
+        ):
+            if code_search_enabled:
+                if sqlite is None:
+                    raise RuntimeError(
+                        f"BSL code-search sidecar unavailable for {source_scope}"
+                    )
+                remaining_units = sqlite.count_units_for_config(
+                    sqlite_scope, config_name
+                )
+                if remaining_units:
+                    raise RuntimeError(
+                        f"BSL cleanup incomplete for {source_scope}: "
+                        f"{remaining_units} units remain"
+                    )
+
+            deleted = self.loader.delete_extension_scope(
+                context.project_name, config_name
+            )
+            total_deleted += deleted
+            if lease is not None:
+                lease.heartbeat()
+
+            remaining_nodes = self.loader.count_extension_scope_nodes(
+                context.project_name, config_name
+            )
+            if remaining_nodes:
+                raise RuntimeError(
+                    f"graph cleanup incomplete for {source_scope}: "
+                    f"{remaining_nodes} nodes remain"
+                )
+
+            # Destructive state transition is deliberately last. If any
+            # postcondition above fails, manifests remain available for retry.
+            with self.state.transaction():
+                self.state.delete_scope(source_scope)
+            context.known_extension_configs.pop(
+                source_scope.split(":", 1)[-1], None
+            )
+            report.notes.append(
+                f"extension scope removed: scope={source_scope} "
+                f"config={config_name} graph_nodes={deleted}"
+            )
+            logger.info(
+                "Extension scope removed completely: scope=%s "
+                "ext_graph_config_name=%s graph_nodes=%d",
+                source_scope,
+                config_name,
+                deleted,
+            )
+
+        return total_deleted
 
     # -- Apply helpers -----------------------------------------------
 

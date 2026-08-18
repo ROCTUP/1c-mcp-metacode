@@ -215,6 +215,15 @@ class IncrementalReport:
     # Per-extension sub-reports: key = ext_dir_name, value = IncrementalReport scope-а.
     extension_reports: Dict[str, "IncrementalReport"] = field(default_factory=dict)
 
+    # Top-level extension directories that disappeared in this cycle.
+    # Mapping: phase-1 scope (`xml_ext:<dir>` / `txt_ext:<dir>`) →
+    # graph configuration name (`<Config>$ext$`).
+    #
+    # Removal is intentionally deferred until after artifact/BSL phases: those
+    # phases need the still-intact manifests and bsl_file_artifacts to remove
+    # routines from Neo4j and the code-search sidecar consistently.
+    removed_extension_scopes: Dict[str, str] = field(default_factory=dict)
+
     duration_seconds: float = 0.0
     errors: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
@@ -234,7 +243,12 @@ class IncrementalReport:
 
     @property
     def has_changes(self) -> bool:
-        if self.added_qns or self.changed_qns or self.deleted_qns:
+        if (
+            self.added_qns
+            or self.changed_qns
+            or self.deleted_qns
+            or self.removed_extension_scopes
+        ):
             return True
         return any(sub.has_changes for sub in self.extension_reports.values())
 
@@ -272,6 +286,7 @@ class IncrementalReport:
                 self.extension_reports[ext_name] = sub
             else:
                 existing.merge(sub)
+        self.removed_extension_scopes.update(other.removed_extension_scopes)
         self.duration_seconds += other.duration_seconds
         self.errors.extend(other.errors)
         self.notes.extend(other.notes)
@@ -294,6 +309,8 @@ class IncrementalReport:
             parts.append(
                 f"extensions scanned={len(self.extension_reports)} changed={ext_changed}"
             )
+        if self.removed_extension_scopes:
+            parts.append(f"extensions removed={len(self.removed_extension_scopes)}")
         parts.append(
             f"errors={len(self.errors)} duration={self.duration_seconds:.2f}s"
         )

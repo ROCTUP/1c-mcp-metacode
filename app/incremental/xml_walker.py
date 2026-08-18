@@ -1002,7 +1002,8 @@ def xml_incremental_run_extensions(
 
     Шаги (см. план §6):
     1. LOAD_EXTENSIONS=false или нет extensions_directory → выход.
-    2. Top-level diff: удалённые scope → `_apply_ext_removed`.
+    2. Top-level diff: удалённые scope регистрируются для deferred purge после
+       artifact/BSL-фаз.
     3. Для каждого живого `<ext_dir>`:
        - validation `code/Configuration.xml`;
        - listing `metadata_xml_files`, candidate detection через mtime+size+hash;
@@ -1034,13 +1035,18 @@ def xml_incremental_run_extensions(
         ext_graph_config_name = _extract_ext_cfg_name_from_state(
             state, scope, project_name
         )
-        _apply_ext_removed(
-            loader=loader,
-            state=state,
-            source_scope=scope,
-            project_name=project_name,
-            ext_graph_config_name=ext_graph_config_name,
-        )
+        if ext_graph_config_name:
+            report.removed_extension_scopes[scope] = ext_graph_config_name
+            report.notes.append(
+                f"extension removal deferred: scope={scope} "
+                f"config={ext_graph_config_name}"
+            )
+        else:
+            # Do not drop state: without the graph config name a scoped purge
+            # cannot be proven safe, and retaining the scope enables retry.
+            report.errors.append(
+                f"cannot defer extension removal without config name: scope={scope}"
+            )
 
     # 3. Per-extension.
     for ext_dir in sorted(ext_dirs, key=lambda d: d.name):
@@ -1053,15 +1059,22 @@ def xml_incremental_run_extensions(
         # Validation: required code/Configuration.xml.
         if not config_xml.exists():
             if scope_exists:
-                _apply_ext_removed(
-                    loader=loader,
-                    state=state,
-                    source_scope=source_scope,
-                    project_name=project_name,
-                    ext_graph_config_name=_extract_ext_cfg_name_from_state(
-                        state, source_scope, project_name
-                    ),
+                ext_graph_config_name = _extract_ext_cfg_name_from_state(
+                    state, source_scope, project_name
                 )
+                if ext_graph_config_name:
+                    report.removed_extension_scopes[source_scope] = (
+                        ext_graph_config_name
+                    )
+                    report.notes.append(
+                        f"extension removal deferred after validation failure: "
+                        f"scope={source_scope} config={ext_graph_config_name}"
+                    )
+                else:
+                    report.errors.append(
+                        f"cannot defer invalid extension removal without config "
+                        f"name: scope={source_scope}"
+                    )
             continue
 
         sub_report = IncrementalReport(source_type=source_scope)

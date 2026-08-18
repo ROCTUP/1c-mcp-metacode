@@ -523,6 +523,86 @@ class IncrementalLoaderMixin:
                     break
         return total
 
+    def delete_extension_scope(
+        self,
+        project_name: str,
+        config_name: str,
+        batch_size: Optional[int] = None,
+    ) -> int:
+        """Delete every node owned by one extension configuration.
+
+        Extension form internals do not consistently carry ``project_name``.
+        Ownership is therefore proven by the exact ``config_name`` together
+        with at least one project-qualified property (project, QN or owner QN).
+        The Configuration node itself has no ``config_name`` and is matched by
+        its exact qualified name.
+        """
+        if not project_name or not config_name:
+            raise ValueError("project_name and config_name are required")
+        bs = batch_size or settings.neo4j_batch_size
+        config_qn = f"{project_name}/{config_name}"
+        config_prefix = config_qn + "/"
+        total = 0
+        cypher = """
+        MATCH (n)
+        WHERE (n.project_name = $project_name AND n.config_name = $config_name)
+           OR n.qualified_name = $config_qn
+           OR (n.qualified_name IS NOT NULL
+               AND n.qualified_name STARTS WITH $config_prefix)
+           OR n.owner_qn = $config_qn
+           OR (n.owner_qn IS NOT NULL
+               AND n.owner_qn STARTS WITH $config_prefix)
+        WITH n LIMIT $batch_size
+        DETACH DELETE n
+        RETURN count(n) AS deleted
+        """
+        with self.driver.session(database=settings.neo4j_database) as session:
+            while True:
+                rec = session.run(
+                    cypher,
+                    project_name=project_name,
+                    config_name=config_name,
+                    config_qn=config_qn,
+                    config_prefix=config_prefix,
+                    batch_size=bs,
+                ).single()
+                deleted = int(rec["deleted"] if rec else 0)
+                total += deleted
+                if deleted < bs:
+                    break
+        return total
+
+    def count_extension_scope_nodes(
+        self,
+        project_name: str,
+        config_name: str,
+    ) -> int:
+        """Return nodes matching the same ownership predicate as purge."""
+        if not project_name or not config_name:
+            return 0
+        config_qn = f"{project_name}/{config_name}"
+        config_prefix = config_qn + "/"
+        with self.driver.session(database=settings.neo4j_database) as session:
+            rec = session.run(
+                """
+                MATCH (n)
+                WHERE (n.project_name = $project_name
+                       AND n.config_name = $config_name)
+                   OR n.qualified_name = $config_qn
+                   OR (n.qualified_name IS NOT NULL
+                       AND n.qualified_name STARTS WITH $config_prefix)
+                   OR n.owner_qn = $config_qn
+                   OR (n.owner_qn IS NOT NULL
+                       AND n.owner_qn STARTS WITH $config_prefix)
+                RETURN count(n) AS count
+                """,
+                project_name=project_name,
+                config_name=config_name,
+                config_qn=config_qn,
+                config_prefix=config_prefix,
+            ).single()
+        return int(rec["count"] if rec else 0)
+
     # ------------------------------------------------------------------
     # delete_metadata_object_node + empty category cleanup
     # ------------------------------------------------------------------

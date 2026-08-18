@@ -481,6 +481,7 @@ class IncrementalLoadingScheduler(threading.Thread):
             base_configuration=base_configuration,
             ext_configurations=ext_configurations,
             source_mode=getattr(self.settings_obj, "metadata_source", "txt"),
+            removed_extension_scopes=dict(report.removed_extension_scopes),
         )
 
         # Propagate ssl_owners_dirty из report (изменения подсистем в metadata sync)
@@ -629,8 +630,28 @@ class IncrementalLoadingScheduler(threading.Thread):
         except Exception:
             logger.exception("Phase 5 (BSL code search sync) failed")
 
+        removed_extensions_changed = False
+        if context.removed_extension_scopes:
+            try:
+                removed_extensions_changed = bool(
+                    artifact_sync.finalize_removed_extensions(
+                        settings_obj=self.settings_obj,
+                        context=context,
+                        report=report,
+                        lease=lease,
+                    )
+                )
+            except Exception as exc:
+                logger.exception("Extension removal finalization failed")
+                report.errors.append(
+                    f"extension removal finalization failed: {exc!r}"
+                )
+
         artifact_graph_changed = (
-            context.graph_changed() or bool(bsl_changed) or bool(post_linking_changed)
+            context.graph_changed()
+            or bool(bsl_changed)
+            or bool(post_linking_changed)
+            or removed_extensions_changed
         )
         return (
             set(context.metadata_embedding_repass_qns),
