@@ -153,6 +153,14 @@ class CodeArtifactCycleContext:
     # Используется post-link consumers и base form impact lookup.
     known_extension_configs: Dict[str, str] = field(default_factory=dict)  # ext_dir -> ext_config_name
 
+    # `source_scope` расширений с незавершённым cleanup. Заполняется
+    # scheduler-ом. Такие scope нельзя обрабатывать ни одной фазой: их
+    # `configuration_state` до финализации содержит СТАРОЕ поколение, а
+    # `delete_scope` бьёт по каталогу, а не по config_qn. Обработка привела бы
+    # к воссозданию узлов удалённой конфигурации после стадии `graph_deleted`,
+    # которая повторно не выполняется.
+    blocked_extension_scopes: Set[str] = field(default_factory=set)
+
     # SSL: при изменении подсистем СтандартныеПодсистемы (Состав / ПутьПодсистемы)
     # incremental пайплайн поднимает этот флаг — scheduler после BSL apply
     # запускает loader.refresh_ssl_api_for_project. Scoped refresh для затронутых
@@ -799,6 +807,7 @@ class ArtifactSync:
                     base_config_name=config_name,
                     base_owner_qns=base_predef_owners,
                     source_mode=context.source_mode,
+                    blocked_scopes=getattr(context, "blocked_extension_scopes", None),
                 )
 
         # Help/ru.html (base).
@@ -934,7 +943,18 @@ class ArtifactSync:
         source_mode = getattr(settings_obj, "metadata_source", "txt")
         scopes = self.state.list_extension_scopes(source_mode)
 
+        blocked_scopes = set(getattr(context, "blocked_extension_scopes", None) or ())
+
         for scope in sorted(scopes):
+            # Пропуск ДО чтения `ext_config_qn` и до любой per-scope работы:
+            # ниже `_apply_bsl` сливает отложенный BSL-дифф этого scope, и
+            # переиграть его под старым именем конфигурации значило бы
+            # воскресить сигнатуры удалённого поколения.
+            if scope in blocked_scopes:
+                logger.info(
+                    "Phase 3: %s skipped, extension cleanup pending", scope,
+                )
+                continue
             ext_dir_name = scope.split(f"{source_mode}_ext:", 1)[-1]
             ext_config_qn = self.state.get_extension_scope_config_qn(scope)
             if not ext_config_qn:
@@ -1799,11 +1819,17 @@ class ArtifactSync:
         base_config_name: str,
         base_owner_qns: Set[str],
         source_mode: str,
+        blocked_scopes: Optional[Set[str]] = None,
     ) -> None:
         """При изменении base Predefined.xml пересобрать ADOPTED_FROM scoped для каждого
-        известного extension scope. Источник — state.list_extension_scopes + ext_config_qn."""
+        известного extension scope. Источник — state.list_extension_scopes + ext_config_qn.
+
+        Scope с незавершённым cleanup пропускаются: их `configuration_state`
+        ещё содержит старое имя конфигурации, и рёбра строились бы под уже
+        удалённым поколением, после отработавшей стадии `graph_deleted`."""
         if not base_owner_qns:
             return
+        blocked = set(blocked_scopes or ())
         try:
             from graphdb.extension_relationships_builder import (
                 ExtensionRelationshipsBuilder,
@@ -1812,6 +1838,12 @@ class ArtifactSync:
             rel_builder = ExtensionRelationshipsBuilder(self.loader)
             ext_scopes = self.state.list_extension_scopes(source_mode)
             for scope in sorted(ext_scopes):
+                if scope in blocked:
+                    logger.info(
+                        "PredefinedItem ADOPTED_FROM rebuild: %s skipped, "
+                        "extension cleanup pending", scope,
+                    )
+                    continue
                 ext_cfg_qn = self.state.get_extension_scope_config_qn(scope)
                 if not ext_cfg_qn:
                     continue
@@ -2211,6 +2243,23 @@ class ArtifactSync:
                 )
                 drain_scope = getattr(context, "bsl_code_search_scope", project_name)
                 readiness = sqlite_for_drain.classify_delta_readiness(drain_scope)
+                if readiness == _BslDeltaReadiness.CONFIG_DELETE_IN_PROGRESS:
+                    # Удаление конфигурации владеет serving-состоянием и reader
+                    # gate. Свой diff применять нельзя (шаг 5 переписал бы
+                    # `pending_*_json`, а commit снял бы чужой gate до того, как
+                    # его вклад вычтен), поэтому откладываем работу целиком —
+                    # тем же механизмом, что и при неуспешном drain.
+                    logger.info(
+                        "BSL apply: config delete in progress — deferring BSL "
+                        "changes to the next cycle"
+                    )
+                    try:
+                        self.state.defer_bsl_changes_for_next_cycle(
+                            project_name, source_scope, diff,
+                        )
+                    except Exception:
+                        logger.exception("defer_bsl_changes_for_next_cycle failed")
+                    return
                 if readiness == _BslDeltaReadiness.SCOPED_RETRY:
                     logger.info(
                         "BSL apply: draining pending scoped code-search ledger inline"
@@ -2604,8 +2653,13 @@ class ArtifactSync:
             return
 
         from graphdb.bsl_code_phase_a_worker import (
-            compute_contributions_from_routine_record,
+            compute_contributions_for_ranges,
         )
+        from graphdb.bsl_code_search_delta import (
+            _validate_serving_partition,
+            detect_serving_context_drift,
+        )
+        from graphdb.bsl_code_split import UnitRange
         import json as _json
 
         # Resolve scoped epoch target so the ledger can carry the vector_epoch
@@ -2638,10 +2692,23 @@ class ArtifactSync:
                         r.get("file_path") or r.get("rel_path") or ""
                     )
 
+        # Границы обратного вклада берутся ТОЛЬКО из сохранённого разбиения
+        # serving epoch: `split_routine` не является чистой функцией от
+        # (body, strategy), поэтому пересчёт вычел бы не то, что добавлялось.
+        # Эпоха индекса, а не vector_epoch: units лежат именно в ней.
         try:
-            strategy = getattr(settings_obj, "bsl_code_split_strategy", None) or "structural"
+            units_epoch = int(sqlite_for_scope.get_current_epoch(scoped_scope) or 0)
         except Exception:
-            strategy = "structural"
+            logger.exception("get_current_epoch failed in step 4.5")
+            raise _BslCodeSearchSnapshotFailed()
+        try:
+            serving = sqlite_for_scope.list_serving_routines_by_ids(
+                scoped_scope, units_epoch, snapshot_ids,
+            ) if snapshot_ids else {}
+        except Exception:
+            logger.exception("list_serving_routines_by_ids failed in step 4.5")
+            raise _BslCodeSearchSnapshotFailed()
+
         snapshot_entries: List[Dict[str, Any]] = []
         for rid in snapshot_ids:
             rec = records.get(rid)
@@ -2650,15 +2717,67 @@ class ArtifactSync:
                     "routine_id": rid, "idf_json": "{}", "stats_json": "{}",
                 })
                 continue
+            entry = serving.get(rid)
+            if entry is None:
+                # Не повреждение: у routine без строк в serving epoch вклада в
+                # counters и не было (пустое тело или неудавшийся split), значит
+                # вычитать нечего. Пересчитать его сейчас означало бы вычесть
+                # никогда не добавленное и увести счётчики в underflow.
+                logger.info(
+                    "BSL scoped snapshot: routine_id=%s has no serving units in "
+                    "epoch=%d — zero reverse contribution", rid, units_epoch,
+                )
+                snapshot_entries.append({
+                    "routine_id": rid, "idf_json": "{}", "stats_json": "{}",
+                })
+                continue
+
+            damage = detect_serving_context_drift(entry, rec)
+            if damage is None:
+                invalid = _validate_serving_partition(
+                    entry["units"], len(rec.get("body") or ""),
+                )
+                if invalid:
+                    damage = ("serving_partition_invalid", f"{rid}: {invalid}")
+            if damage is not None:
+                # Детерминированное повреждение: повтор той же scoped-стадии его
+                # не вылечит, а приблизительное вычитание исказило бы корпусные
+                # счётчики. Выходим в operational full rebuild.
+                logger.warning(
+                    "BSL scoped snapshot: serving partition unusable for "
+                    "routine_id=%s (%s: %s) — requesting full reindex",
+                    rid, damage[0], damage[1],
+                )
+                try:
+                    sqlite_for_scope.request_reindex(scoped_scope)
+                except Exception:
+                    logger.exception(
+                        "failed to set reindex_requested after serving damage"
+                    )
+                raise _BslCodeSearchSnapshotFailed()
+
             try:
-                idf, stats = compute_contributions_from_routine_record(
-                    rec, strategy, sign=1,
+                contribution = compute_contributions_for_ranges(
+                    rec,
+                    [
+                        UnitRange(
+                            char_start=u["char_start"], char_end=u["char_end"],
+                            line_start=u["line_start"], line_end=u["line_end"],
+                            part_index=u["part_index"], part_total=u["part_total"],
+                        )
+                        for u in entry["units"]
+                    ],
+                    sign=1,
                 )
             except Exception:
+                # ContributionComputationError отличает «не смогли посчитать» от
+                # «вклад нулевой»; и то, и другое здесь одинаково недопустимо —
+                # снапшот обязан быть точным описанием старого состояния.
                 logger.exception(
-                    "compute_contributions_from_routine_record failed for %s", rid,
+                    "compute_contributions_for_ranges failed for %s", rid,
                 )
                 raise _BslCodeSearchSnapshotFailed()
+            idf, stats = contribution.idf, contribution.stats
             snapshot_entries.append({
                 "routine_id": rid,
                 "idf_json": _json.dumps(idf, ensure_ascii=False, sort_keys=True),
@@ -3121,6 +3240,31 @@ class BslCodeSearchSync:
         self.state = state
         self.loader = loader
 
+    @staticmethod
+    def _pending_rebuild_is_orphaned(sqlite: Any, scope: str) -> bool:
+        """Похожа ли активная pending epoch на брошенную аварийным потоком.
+
+        Порог берётся тем же правилом, что уже применяется к staleness
+        `scheduler_lock`: новой настройки не заводим.
+        """
+        from config import settings as _settings
+
+        try:
+            interval_minutes = int(
+                getattr(_settings, "incremental_loading_interval_minutes", 60) or 60
+            )
+        except (TypeError, ValueError):
+            interval_minutes = 60
+        stale_after = max(300, 2 * 60 * interval_minutes)
+        try:
+            if not sqlite.pending_is_stale(scope, stale_after):
+                return False
+            fp = sqlite.read_fingerprint(scope) or {}
+            return bool(fp.get("reindex_requested"))
+        except Exception:  # noqa: BLE001
+            logger.exception("BslCodeSearchSync: orphaned-pending probe failed")
+            return False
+
     def run(self, context: CodeArtifactCycleContext, lease: Optional[LockLease]) -> bool:
         """Возвращает True, если Phase 5 достигла стадии Neo4j-мутации в этом цикле
         (visibility flip / удаление RoutineCodeUnit / commit), а не «apply завершён».
@@ -3161,8 +3305,42 @@ class BslCodeSearchSync:
         }
 
         if readiness == DeltaReadiness.PENDING_REBUILD:
+            # Escape для осиротевшей эпохи. `classify_delta_readiness` смотрит
+            # только на сохранённые поля, поэтому rebuild-поток, аварийно
+            # завершившийся с `pending_status='writing'`, оставлял бы это
+            # состояние до рестарта процесса — а cleanup-очередь, ждущая
+            # BSL-стадию, вставала бы вместе с ним навсегда.
+            #
+            # Два условия обязательны: возраст `pending_updated_at` отделяет
+            # мёртвый поток от живого (отметка обновляется на каждом flush
+            # Phase A), а `reindex_requested` подтверждает, что перестройка
+            # действительно кем-то затребована — его ставит cleanup при
+            # возврате DEFERRED.
+            if self._pending_rebuild_is_orphaned(sqlite, scope):
+                logger.warning(
+                    "BslCodeSearchSync: pending rebuild looks orphaned "
+                    "(stale marker + reindex_requested) — restarting full rebuild"
+                )
+                try:
+                    indexer.start_indexing(lease=lease)
+                except Exception:
+                    logger.exception(
+                        "BslCodeSearchSync: orphaned pending recovery failed"
+                    )
+                    return False
+                return True
             logger.info(
                 "BslCodeSearchSync: pending full rebuild active, scoped delta skipped"
+            )
+            return False
+
+        if readiness == DeltaReadiness.CONFIG_DELETE_IN_PROGRESS:
+            # Владелец serving-состояния сейчас — координатор удаления
+            # конфигурации. Ни scoped apply, ни (тем более) full rebuild здесь
+            # запускать нельзя: первый снял бы чужой reader gate, второй —
+            # построил бы эпоху поверх незавершённой saga.
+            logger.info(
+                "BslCodeSearchSync: config delete in progress, phase 5 skipped"
             )
             return False
 

@@ -197,6 +197,34 @@ def _start_readiness_barrier(startup_threads: list) -> None:
     barrier_thread.start()
 
 
+def _start_accelerators_after_startup_indexers(startup_threads: list) -> None:
+    """Build the substring accelerators once the startup indexers are done.
+
+    Deliberately sequential after them, and deliberately outside
+    `_start_readiness_barrier`: nothing waits on these indexes (until one is ONLINE the
+    matching `contains` search runs as a scan, exactly as before), but populating a
+    fulltext index over every Routine while BSL/vector/summary stream the same label
+    would trade startup latency for resource contention.
+    """
+    threads = [t for t in startup_threads if t is not None]
+
+    def _wait_then_start() -> None:
+        for t in threads:
+            try:
+                t.join()
+            except Exception:  # noqa: BLE001 - a dead thread must not block the DDL
+                pass
+        try:
+            from .neo4j_init import start_accelerator_ensure
+            start_accelerator_ensure()
+        except Exception as e:
+            logging.error("Failed to start substring accelerator ensure: %s", e, exc_info=True)
+
+    threading.Thread(
+        target=_wait_then_start, name="accelerator_ensure_barrier", daemon=True,
+    ).start()
+
+
 def _start_incremental_loading_after_startup_indexers(
     startup_threads: list,
     *,
@@ -471,6 +499,7 @@ def _start_post_bootstrap_pipeline(
     summary_thread = _start_object_summary_background(embedding_availability=status)
 
     _start_readiness_barrier([vector_thread, bsl_thread, summary_thread])
+    _start_accelerators_after_startup_indexers([vector_thread, bsl_thread, summary_thread])
     _start_incremental_loading_after_startup_indexers(
         [vector_thread, bsl_thread, summary_thread],
         last_full_scan_at=last_full_scan_at,
@@ -492,6 +521,17 @@ def run_server(skip_startup_incremental: bool = False):
     # Initialize Neo4j connection on startup
     if initialize_neo4j():
         logging.info("Neo4j connection initialized successfully")
+
+        # Pay the search-schema migration here, before the endpoint accepts traffic,
+        # rather than inside the first tool call. A failure is deliberately non-fatal:
+        # only the four norm-dependent tools are gated, and aborting startup would take
+        # console plus ~15 unaffected tools down over a capability they do not use.
+        from .neo4j_init import ensure_search_schema_blocking
+        if not ensure_search_schema_blocking():
+            logging.error(
+                "Routine search schema not ready at startup; BSL routine name/signature "
+                "search is unavailable until it recovers (see degraded reasons)"
+            )
 
         # Get configuration name from database (after metadata is loaded)
         try:

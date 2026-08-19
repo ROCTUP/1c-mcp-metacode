@@ -16,17 +16,26 @@ from datetime import datetime, time as dtime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from .extension_scope_cleanup import (
+    ExtensionDiscoveryEvidence,
+    ExtensionScopeCleanupCoordinator,
+)
 from .hashing import compute_file_hash
 from .metadata_sync import (
-    _apply_ext_removed,
     _configuration_qn,
+    _enqueue_ext_cleanup,
     _refresh_extension_links_scoped,
     apply_configuration_diff,
     apply_deleted_object,
     diff_and_apply_configuration,
 )
 from .report import IncrementalReport
-from .state import IncrementalLoadingState
+from .state import (
+    CLEANUP_REASON_CONFIGURATION_RENAMED,
+    CLEANUP_REASON_DIRECTORY_REMOVED,
+    CLEANUP_REASON_STRUCTURE_INVALID,
+    IncrementalLoadingState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -997,21 +1006,19 @@ def xml_incremental_run_extensions(
     report: IncrementalReport,
     base_impact: BaseImpact,
     xml_context: Optional[XmlCycleContext] = None,
+    cleanup_coordinator: Any = None,
 ) -> None:
     """XML-инкрементал расширений (один цикл).
 
-    Шаги (см. план §6):
+    Два прохода, симметрично TXT-ветке (см. план, этап 7):
+
     1. LOAD_EXTENSIONS=false или нет extensions_directory → выход.
-    2. Top-level diff: удалённые scope → `_apply_ext_removed`.
-    3. Для каждого живого `<ext_dir>`:
-       - validation `code/Configuration.xml`;
-       - listing `metadata_xml_files`, candidate detection через mtime+size+hash;
-       - overlay-affected_qns от `base_impact.added∪changed∪deleted`;
-       - configuration_changed=True ветка: узкий reparse `<ext_code_dir>/Configuration.xml`
-         + overlay + `apply_configuration_diff(is_extension=True)`;
-       - scoped reparse (`is_extension=True`) + overlay → `diff_and_apply_configuration(is_extension=True)`;
-       - `_refresh_extension_links` после применения;
-       - manifest/stage update.
+    2. **Проход 1 — наблюдение**: top-level diff и проверка
+       `code/Configuration.xml`; заполняется evidence; проблемные scope идут в
+       очередь на удаление. Ничего не грузится и не парсится.
+    3. **Между проходами** — `resume_pending` с evidence.
+    4. **Проход 2 — загрузка**: `_process_xml_extension_scope` только для
+       каталогов без незавершённого cleanup.
     """
     extensions_dir = getattr(settings_obj, "extensions_directory", None)
     if not getattr(settings_obj, "load_extensions", True):
@@ -1021,48 +1028,73 @@ def xml_incremental_run_extensions(
 
     project_name = settings_obj.project_name
     base_cfg_name = _detect_base_config_name_xml(state, project_name)
+    coordinator = cleanup_coordinator or ExtensionScopeCleanupCoordinator(
+        loader, state, settings_obj,
+    )
 
     ext_dirs = [d for d in extensions_dir.iterdir() if d.is_dir()]
     on_disk_names = {d.name for d in ext_dirs}
-
-    # 2. Top-level удалённые каталоги.
     known_scopes = state.list_extension_scopes("xml")
+
+    # ---------- Проход 1: наблюдение + enqueue ----------
+    revalidated: Set[str] = set()
+
     for scope in sorted(known_scopes):
         ext_dir_name = scope.split("xml_ext:", 1)[-1]
         if ext_dir_name in on_disk_names:
             continue
-        ext_graph_config_name = _extract_ext_cfg_name_from_state(
-            state, scope, project_name
-        )
-        _apply_ext_removed(
-            loader=loader,
+        _enqueue_ext_cleanup(
+            coordinator=coordinator,
             state=state,
+            report=report,
             source_scope=scope,
+            source_mode="xml",
+            ext_dir_name=ext_dir_name,
             project_name=project_name,
-            ext_graph_config_name=ext_graph_config_name,
+            reason=CLEANUP_REASON_DIRECTORY_REMOVED,
+            loader=loader,
         )
 
-    # 3. Per-extension.
     for ext_dir in sorted(ext_dirs, key=lambda d: d.name):
         ext_dir_name = ext_dir.name
         source_scope = f"xml_ext:{ext_dir_name}"
-        scope_exists = source_scope in known_scopes
-        ext_code_dir = ext_dir / "code"
-        config_xml = ext_code_dir / "Configuration.xml"
-
-        # Validation: required code/Configuration.xml.
-        if not config_xml.exists():
-            if scope_exists:
-                _apply_ext_removed(
-                    loader=loader,
-                    state=state,
-                    source_scope=source_scope,
-                    project_name=project_name,
-                    ext_graph_config_name=_extract_ext_cfg_name_from_state(
-                        state, source_scope, project_name
-                    ),
-                )
+        if (ext_dir / "code" / "Configuration.xml").exists():
+            revalidated.add(ext_dir_name)
             continue
+        if source_scope in known_scopes:
+            _enqueue_ext_cleanup(
+                coordinator=coordinator,
+                state=state,
+                report=report,
+                source_scope=source_scope,
+                source_mode="xml",
+                ext_dir_name=ext_dir_name,
+                project_name=project_name,
+                reason=CLEANUP_REASON_STRUCTURE_INVALID,
+                loader=loader,
+            )
+
+    # ---------- Между проходами: продвинуть очередь ----------
+    evidence = ExtensionDiscoveryEvidence(
+        present_ext_dirs=on_disk_names,
+        revalidated_ext_dirs=revalidated,
+    )
+    coordinator.resume_pending(report, evidence=evidence)
+
+    # ---------- Проход 2: загрузка ----------
+    for ext_dir in sorted(ext_dirs, key=lambda d: d.name):
+        ext_dir_name = ext_dir.name
+        if ext_dir_name not in revalidated:
+            continue
+        source_scope = f"xml_ext:{ext_dir_name}"
+        if coordinator.has_pending_cleanup(source_scope):
+            logger.info(
+                "XML extension %s skipped: cleanup pending for %s",
+                ext_dir_name, source_scope,
+            )
+            report.notes.append(f"ext {ext_dir_name}: skipped, cleanup pending")
+            continue
+        ext_code_dir = ext_dir / "code"
 
         sub_report = IncrementalReport(source_type=source_scope)
         try:
@@ -1078,6 +1110,9 @@ def xml_incremental_run_extensions(
                 base_impact=base_impact,
                 xml_context=xml_context,
                 settings_obj=settings_obj,
+                cleanup_coordinator=coordinator,
+                evidence=evidence,
+                root_report=report,
             )
         except Exception as exc:  # noqa: BLE001
             logger.exception("XML extension sync failed for %s", ext_dir_name)
@@ -1098,6 +1133,9 @@ def _process_xml_extension_scope(
     base_impact: BaseImpact,
     xml_context: Optional[XmlCycleContext] = None,
     settings_obj: Any = None,
+    cleanup_coordinator: Any = None,
+    evidence: Any = None,
+    root_report: Optional[IncrementalReport] = None,
 ) -> None:
     """Один scope расширения XML — обнаружение изменений + overlay refresh + apply.
 
@@ -1282,14 +1320,40 @@ def _process_xml_extension_scope(
     old_qn = state.get_extension_scope_config_qn(source_scope)
     rename_detected = False
     if old_qn is not None and old_qn != parsed_qn:
-        old_ext_cfg_name = old_qn.split("/", 1)[1] if "/" in old_qn else old_qn
-        _apply_ext_removed(
-            loader=loader,
+        # Rename обнаруживается только здесь — нужен парсинг Configuration.xml,
+        # поэтому в проходе 1 его не поймать.
+        if cleanup_coordinator is None:
+            report.errors.append(
+                f"xml extension {ext_dir_name}: rename detected but no cleanup "
+                "coordinator available"
+            )
+            return
+        _enqueue_ext_cleanup(
+            coordinator=cleanup_coordinator,
             state=state,
+            report=root_report if root_report is not None else report,
             source_scope=source_scope,
+            source_mode="xml",
+            ext_dir_name=ext_dir_name,
             project_name=project_name,
-            ext_graph_config_name=old_ext_cfg_name,
+            reason=CLEANUP_REASON_CONFIGURATION_RENAMED,
+            config_qn=old_qn,
+            loader=loader,
         )
+        cleanup_coordinator.resume_pending(
+            root_report if root_report is not None else report,
+            evidence=evidence if evidence is not None else ExtensionDiscoveryEvidence(),
+        )
+        if cleanup_coordinator.has_pending_cleanup(source_scope):
+            # Старое поколение снесено не до конца. Загружать новое сейчас
+            # нельзя: его baseline уничтожил бы будущий `delete_scope` — тот
+            # бьёт по каталогу, а не по config_qn.
+            logger.info(
+                "XML extension %s: rename cleanup not finalized, deferring load",
+                ext_dir_name,
+            )
+            report.notes.append("rename deferred until cleanup finalizes")
+            return
         rename_detected = True
         scope_baseline_empty = True  # после wipe scope пуст
 
@@ -1439,8 +1503,8 @@ def _process_xml_extension_scope(
     try:
         if is_full_init:
             # Полный diff: affected_object_qns=None → diff_and_apply сравнивает
-            # parsed_qns vs state.get_all_object_qns(scope). После _apply_ext_removed
-            # state пуст → все parsed объекты будут added (что и нужно).
+            # parsed_qns vs state.get_all_object_qns(scope). После финализации
+            # cleanup state пуст → все parsed объекты будут added (что и нужно).
             diff_and_apply_configuration(
                 loader=loader,
                 state=state,
@@ -1491,7 +1555,7 @@ def _process_xml_extension_scope(
     # Стратегия:
     # 1. Все hashed-в-этом-раунде файлы (reused=False) — refresh. emitted_qns
     #    пересчитывается через текущий ext_graph_config_name. Это закрывает
-    #    rename: после `_apply_ext_removed` manifest_by_rel в памяти содержит
+    #    rename: после финализации cleanup manifest_by_rel в памяти содержит
     #    старые префиксы; здесь мы их игнорируем.
     # 2. Все scoped_files — manifest row после apply. Для stat-matched (reused=True)
     #    файлов в is_full_init берём cached size/mtime_ns/content_hash;
@@ -1570,12 +1634,21 @@ def xml_full_scan_run_extensions(
     settings_obj: Any,
     report: IncrementalReport,
     xml_context: Optional[XmlCycleContext] = None,
+    blocked_scopes: Optional[Set[str]] = None,
 ) -> None:
     """Full XML scan для расширений: ищет удалённые XML descriptors внутри
     каталогов расширений по разнице с manifest.
 
     Use `xml_context.overlay_provider` для scoped base config — никаких
     `_parse_xml_full` в hot path.
+
+    `blocked_scopes` — scope с незавершённым cleanup. Это отдельный вызов
+    scheduler в full-reconcile окне, поэтому гейт из
+    `xml_incremental_run_extensions` его не покрывает: функция сама выводит
+    список scope из state и берёт имя конфигурации из `configuration_state`,
+    который до финализации ещё содержит СТАРОЕ поколение. Без фильтра она
+    записала бы граф и manifest уже после destructive-границы, а последующий
+    `delete_scope` снёс бы этот state.
     """
     if not getattr(settings_obj, "load_extensions", True):
         return
@@ -1588,6 +1661,7 @@ def xml_full_scan_run_extensions(
 
     scopes = state.list_extension_scopes("xml")
     on_disk_names = {d.name for d in extensions_dir.iterdir() if d.is_dir()}
+    blocked = set(blocked_scopes or ())
 
     base_cfg_name = ""
     if xml_context is not None:
@@ -1599,6 +1673,11 @@ def xml_full_scan_run_extensions(
         ext_dir_name = scope.split("xml_ext:", 1)[-1]
         if ext_dir_name not in on_disk_names:
             # Top-level deletion обрабатывается в xml_incremental_run_extensions, skip.
+            continue
+        if scope in blocked:
+            logger.info(
+                "XML ext full scan: %s skipped, cleanup pending", scope,
+            )
             continue
         ext_code_dir = extensions_dir / ext_dir_name / "code"
         if not ext_code_dir.exists():

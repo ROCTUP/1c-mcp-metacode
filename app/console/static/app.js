@@ -8,7 +8,7 @@ const AUTH_TOKEN = CURRENT_USER.token || '';
 const IS_ADMIN = CURRENT_USER.role === 'admin';
 const AUTH_USER_KEY = String(CURRENT_USER.userId || CURRENT_USER.login || 'anonymous');
 const CONSOLE_PATH = normalizePath(cfg.consolePath || '/console');
-const APP_VERSION = String(cfg.appVersion || '2.0.0');
+const APP_VERSION = String(cfg.appVersion || '2.0.1');
 const AGENT_ENABLED = Boolean(cfg.agentEnabled);
 const AGENT_LLM = cfg.agentLlm || {};
 

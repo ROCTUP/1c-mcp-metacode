@@ -47,6 +47,25 @@ def apply_match(field_expr: str, param_name: str, mode: Optional[str] = "exact")
         return f"toLower({field_expr}) = toLower(${param_name})"
 
 
+def apply_match_norm(field_expr: str, param_name: str, mode: Optional[str] = "exact") -> str:
+    """Same predicate as apply_match, but `field_expr` must already be a `*_norm` property.
+
+    Example: apply_match_norm("r.name_norm", "text", "contains")
+    → "r.name_norm CONTAINS toLower($text)"
+
+    Only the parameter is lowercased. Wrapping the property in toLower()/coalesce()
+    turns an index seek into a full label scan, which is the whole reason the
+    denormalized field exists — so pass the raw property here, never an expression.
+    """
+    mode = (mode or "exact").lower()
+    if mode == "starts_with":
+        return f"{field_expr} STARTS WITH toLower(${param_name})"
+    elif mode == "contains":
+        return f"{field_expr} CONTAINS toLower(${param_name})"
+    else:
+        return f"{field_expr} = toLower(${param_name})"
+
+
 def _run_query(loader: Any, cypher: str, params: Dict[str, Any], project_name: str) -> List[Dict[str, Any]]:
     """
     Execute a read-only Cypher query, always injecting project_name.

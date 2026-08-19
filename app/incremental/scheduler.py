@@ -20,6 +20,7 @@ import logging
 import os
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Set, TYPE_CHECKING
@@ -27,6 +28,7 @@ from typing import Any, Dict, Optional, Set, TYPE_CHECKING
 if TYPE_CHECKING:
     from graphdb.embedding_service import EmbeddingAvailability
 
+from .extension_scope_cleanup import ExtensionScopeCleanupCoordinator
 from .metadata_sync import MetadataIncrementalSync
 from .report import IncrementalReport
 from .state import ArtifactBaselineReadiness, IncrementalLoadingState, LockLease
@@ -48,6 +50,59 @@ logger = logging.getLogger(__name__)
 
 
 SCHEDULER_LOCK_NAME = "incremental_main"
+
+
+@dataclass
+class BslCodeSearchServices:
+    """BSL-подсистема цикла: один экземпляр на весь incremental cycle.
+
+    Раньше indexer/applier создавались внутри artifact-фаз, то есть ПОЗЖЕ
+    metadata cleanup. Для удаления расширения это не годится: снимок обратного
+    вклада обязан строиться до удаления графа, а координатор запускается
+    дважды до artifact-фаз. Поэтому bundle поднимается сразу после захвата
+    `scheduler_lock` и передаётся всем потребителям цикла — второго владельца
+    sidecar в цикле не появляется.
+    """
+
+    scope: str
+    indexer: Any
+    sqlite: Any
+    delta_applier: Any
+
+
+def _build_bsl_services(
+    loader: Any,
+    settings_obj: Any,
+    embedding_availability: Optional["EmbeddingAvailability"] = None,
+) -> Optional[BslCodeSearchServices]:
+    """Собрать bundle или вернуть None при выключенной подсистеме.
+
+    None при `enable_bsl_code_search=False` принципиален: конструктор
+    `BslCodeSqlite` материализовал бы файл и схему sidecar для выключенной
+    подсистемы, и позднее включение доверилось бы этому ready-state без
+    перезагрузки. Операцию, уже пересёкшую destructive-границу, в этом режиме
+    закрывает узкий recovery-accessor координатора.
+    """
+    if not getattr(settings_obj, "enable_bsl_code_search", False):
+        return None
+    try:
+        from graphdb.bsl_code_indexer import BslCodeSearchIndexer
+        from graphdb.bsl_code_search_delta import BslCodeSearchDeltaApplier
+
+        indexer = BslCodeSearchIndexer(
+            loader.driver, embedding_availability=embedding_availability,
+        )
+        return BslCodeSearchServices(
+            scope=indexer.scope,
+            indexer=indexer,
+            sqlite=indexer.sqlite,
+            delta_applier=BslCodeSearchDeltaApplier(
+                sqlite=indexer.sqlite, indexer=indexer,
+            ),
+        )
+    except Exception:
+        logger.exception("BSL code search services setup failed")
+        return None
 
 
 def _cycle_id() -> str:
@@ -233,11 +288,35 @@ class IncrementalLoadingScheduler(threading.Thread):
         routine_doc_ids: set = set()
         stats_refresh_needed = False
         try:
+            # BSL bundle поднимается ДО координатора: `resume_pending` ниже
+            # может начать удаление расширения, а его подготовка обязана
+            # успеть построить снимок обратного вклада, пока граф цел.
+            bsl_services = _build_bsl_services(
+                self.loader, self.settings_obj, embedding_availability,
+            )
+            # Один координатор на цикл: он владеет durable-очередью удаления
+            # extension scope и множеством заблокированных scope, которое
+            # читают все фазы.
+            cleanup_coordinator = ExtensionScopeCleanupCoordinator(
+                self.loader, state, self.settings_obj, lease=lease,
+                bsl_services=bsl_services,
+            )
             sync = MetadataIncrementalSync(
                 self.loader, state,
                 use_startup_probe_for_vectors=use_startup_probe_for_vectors,
+                cleanup_coordinator=cleanup_coordinator,
             )
+            # Возобновление ДО discovery: без evidence обрабатываются только
+            # записи, уже пересекшие destructive-границу. Им guard не нужен —
+            # saga обязана дойти до конца независимо от того, что на диске, —
+            # а вот запись на стадии `discovered` без authoritative-фактов
+            # трогать нельзя.
+            report_prelude = IncrementalReport(source_type="cleanup")
+            cleanup_coordinator.resume_pending(report_prelude)
+            lease.heartbeat()
+
             report = sync.run(self.settings_obj)
+            report.removed_extension_scopes[:0] = report_prelude.removed_extension_scopes
             embedding_repass_needed |= report.embedding_repass_needed_qns
             lease.heartbeat()
 
@@ -249,6 +328,7 @@ class IncrementalLoadingScheduler(threading.Thread):
                     report=report,
                     include_xml_full_scan=include_xml_full_scan,
                     embedding_repass_needed=embedding_repass_needed,
+                    cleanup_coordinator=cleanup_coordinator,
                 )
 
             # Phase 2-4: artifacts + post-linking. Запускаются ВНУТРИ scheduler_lock
@@ -256,12 +336,26 @@ class IncrementalLoadingScheduler(threading.Thread):
             metadata_qns, routine_doc_ids, artifact_graph_changed = self._run_artifact_phases(
                 state=state, report=report, lease=lease,
                 embedding_availability=embedding_availability,
+                cleanup_coordinator=cleanup_coordinator,
+                bsl_services=bsl_services,
             )
             embedding_repass_needed |= metadata_qns
             stats_refresh_needed = report.has_graph_changes or artifact_graph_changed
 
             for line in report.detailed_summary_lines():
                 logger.info("Incremental cycle complete: %s", line)
+
+            # Periodic reconcile of the search accelerators. Unconditional on purpose:
+            # the index-ensure helpers inside metadata_sync only run when there is
+            # something to load, so on a stable configuration (the steady state) they
+            # never fire — and an index dropped at runtime would stay missing until a
+            # restart. Placed after metadata writes so a re-create never competes with
+            # them; the call itself is a SHOW INDEXES over the manifest names.
+            try:
+                from mcpsrv.neo4j_init import start_accelerator_ensure
+                start_accelerator_ensure()
+            except Exception as e:  # noqa: BLE001 - reconcile must not fail the cycle
+                logger.warning("Accelerator reconcile skipped: %s", e)
         except Exception:
             _log_cycle_boundary(
                 "FAILED",
@@ -317,6 +411,7 @@ class IncrementalLoadingScheduler(threading.Thread):
         report: IncrementalReport,
         include_xml_full_scan: bool,
         embedding_repass_needed: set,
+        cleanup_coordinator: Optional[ExtensionScopeCleanupCoordinator] = None,
     ) -> None:
         """XML-цикл порядок:
         1. (уже сделано sync.sync_xml) base sync — собрал added/changed/configuration_changed в report.
@@ -364,20 +459,39 @@ class IncrementalLoadingScheduler(threading.Thread):
                 report=report,
                 base_impact=base_impact,
                 xml_context=xml_context,
+                cleanup_coordinator=cleanup_coordinator,
             )
         except Exception:
             logger.exception("XML extension incremental run failed")
         embedding_repass_needed |= report.embedding_repass_needed_qns
 
         # 5. Extension full-scan.
+        # Отдельный путь: он сам выводит список scope из state, поэтому гейт
+        # внутри incremental-ветки его не покрывает — множество блокировок
+        # передаётся явно.
         if in_window:
             try:
+                try:
+                    blocked = (
+                        cleanup_coordinator.blocked_scopes(refresh=True)
+                        if cleanup_coordinator is not None
+                        else state.list_pending_cleanup_scopes()
+                    )
+                except Exception:
+                    # Fail-closed: без источника блокировки full-scan не должен
+                    # трогать расширения вовсе.
+                    logger.exception(
+                        "XML extension full scan: cleanup queue unreadable; "
+                        "blocking all extension scopes"
+                    )
+                    blocked = state.list_extension_scopes("xml")
                 xml_full_scan_run_extensions(
                     loader=self.loader,
                     state=state,
                     settings_obj=self.settings_obj,
                     report=report,
                     xml_context=xml_context,
+                    blocked_scopes=blocked,
                 )
             except Exception:
                 logger.exception("XML extension full scan failed")
@@ -402,6 +516,8 @@ class IncrementalLoadingScheduler(threading.Thread):
         report: IncrementalReport,
         lease: LockLease,
         embedding_availability: Optional["EmbeddingAvailability"] = None,
+        cleanup_coordinator: Optional[ExtensionScopeCleanupCoordinator] = None,
+        bsl_services: Optional[BslCodeSearchServices] = None,
     ) -> tuple:
         """Phase 2 (base artifacts) → Phase 3 (extension artifacts) → Phase 4 (post-linking).
 
@@ -500,9 +616,45 @@ class IncrementalLoadingScheduler(threading.Thread):
         # rebuild) читают его, а не `affected_extension_configs` (последний —
         # diagnostic поле, зависит от успешности filesystem traversal).
         source_mode = getattr(self.settings_obj, "metadata_source", "txt")
+        # Scope с незавершённым cleanup исключаются из реестра активных
+        # расширений. Финализированный scope исчезает из state сам, а вот
+        # нефинализированный там ещё есть, и без вычитания artifact phase
+        # применила бы актуальные файлы каталога под СТАРЫМ config_qn, воссоздав
+        # узлы уже удалённого поколения после отработавшей стадии graph_deleted.
+        try:
+            blocked_scopes = (
+                cleanup_coordinator.blocked_scopes(refresh=True)
+                if cleanup_coordinator is not None
+                else state.list_pending_cleanup_scopes()
+            )
+        except Exception:
+            # Fail-closed: не зная, какие scope небезопасны, блокируем все.
+            # Пропустить обновление расширений на один цикл дешевле, чем
+            # обработать scope с уже разрушенным графом — стадии монотонны,
+            # повторной очистки не будет, и узлы старого поколения остались бы
+            # orphan-подграфом.
+            logger.exception(
+                "Phase 2-4: pending cleanup scopes query failed; blocking all "
+                "extension scopes for this cycle"
+            )
+            try:
+                blocked_scopes = state.list_extension_scopes(source_mode)
+            except Exception:
+                logger.exception(
+                    "Phase 2-4: cannot enumerate extension scopes either; "
+                    "skipping artifact phases"
+                )
+                return set(), set(), False
+        context.blocked_extension_scopes = set(blocked_scopes)
         try:
             ext_scopes = state.list_extension_scopes(source_mode)
             for scope in ext_scopes:
+                if scope in blocked_scopes:
+                    logger.info(
+                        "Phase 2-4: %s excluded from known_extension_configs, "
+                        "cleanup pending", scope,
+                    )
+                    continue
                 ext_cfg_qn = state.get_extension_scope_config_qn(scope)
                 if not ext_cfg_qn:
                     continue
@@ -540,33 +692,17 @@ class IncrementalLoadingScheduler(threading.Thread):
         # тихо skip-ается, phase 2/3 не делают scoped code embedding invalidation
         # (но `clear_routine_doc_embeddings` всё равно работает — это отдельный
         # owner в incremental_loader).
-        if getattr(self.settings_obj, "enable_bsl_code_search", False):
-            try:
-                from graphdb.bsl_code_indexer import BslCodeSearchIndexer
-                from graphdb.bsl_code_search_delta import BslCodeSearchDeltaApplier
-
-                # Construction-time ownership: the startup EmbeddingAvailability
-                # is set here so every call site in this cycle (the _apply_bsl
-                # SCOPED_RETRY drain and the Phase 5 BslCodeSearchSync) inherits
-                # it. Scheduled cycles pass None → current production behaviour.
-                _indexer = BslCodeSearchIndexer(
-                    self.loader.driver, embedding_availability=embedding_availability
-                )
-                # The applier delegates scoped Phase B to _indexer, which already
-                # carries the availability, so both the _apply_bsl drain and
-                # Phase 5 inherit it through the shared indexer instance.
-                context.bsl_code_search_delta_applier = BslCodeSearchDeltaApplier(
-                    sqlite=_indexer.sqlite,
-                    indexer=_indexer,
-                )
-                context.bsl_code_search_scope = _indexer.scope
-                # Also expose the underlying indexer/sqlite so `_apply_bsl`
-                # can capture the OLD routine context (step 4.5 snapshot+ledger)
-                # without re-instantiating the indexer.
-                context.bsl_code_search_indexer = _indexer
-                context.bsl_code_search_sqlite = _indexer.sqlite
-            except Exception:
-                logger.exception("Phase 5 setup: BslCodeSearchDeltaApplier injection failed")
+        # Bundle цикла уже поднят в `_cycle` (до cleanup coordinator) — здесь
+        # он только раздаётся потребителям artifact-фаз и Phase 5. Второй
+        # индексер в цикле не конструируется: два владельца sidecar означали бы
+        # две разные точки зрения на epoch state machine.
+        if bsl_services is not None:
+            context.bsl_code_search_delta_applier = bsl_services.delta_applier
+            context.bsl_code_search_scope = bsl_services.scope
+            # `_apply_bsl` захватывает OLD routine context (шаг 4.5
+            # snapshot+ledger) через эти же объекты.
+            context.bsl_code_search_indexer = bsl_services.indexer
+            context.bsl_code_search_sqlite = bsl_services.sqlite
 
         artifact_sync = ArtifactSync(self.loader, state)
         try:

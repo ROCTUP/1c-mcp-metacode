@@ -20,6 +20,15 @@ from typing import List, Optional, Set, Tuple
 logger = logging.getLogger(__name__)
 
 
+class SplitProgressError(RuntimeError):
+    """Скользящее окно не сошлось за отведённое число итераций.
+
+    Ловится `process_batch`, поэтому тело уходит в `split_failed`, а Phase A
+    продолжает работу. Существует как класс-барьер: любая ошибка непрогресса
+    обязана стать счётчиком с логом, а не бесконечным циклом внутри воркера.
+    """
+
+
 # Tree-sitter is a hard dependency for the strict best-approach path. Import is
 # lazy + cached so an import-time failure surfaces only when the splitter is
 # actually used (BSL code search is opt-in via ENABLE_BSL_CODE_SEARCH).
@@ -660,6 +669,46 @@ def _find_safe_line_end(
     return None
 
 
+# Ранги разделителей для вырожденной ступени реза. Строка длиннее окна не
+# содержит ни концов операторов, ни переносов, поэтому безопасной границы внутри
+# неё нет вообще — режем по символам-разделителям. Ранг важнее близости к цели:
+# разделитель пакета сильнее разделителя строки запроса, тот сильнее разделителя
+# полей. Для всех, кроме вертикальной черты, рез идёт ПОСЛЕ символа; черта
+# открывает строку текста запроса, поэтому рез ставится ПЕРЕД ней.
+_SEPARATOR_SEMICOLON_RANK = 4
+_SEPARATOR_PIPE_RANK = 3
+_SEPARATOR_COMMA_RANK = 2
+_SEPARATOR_SPACE_RANK = 1
+
+
+def _separator_cut(text: str, lo: int, hi: int, target: int) -> Optional[int]:
+    """Позиция реза в [lo, hi], ближайшая к target среди разделителей
+    максимального доступного ранга. None — разделителей в интервале нет."""
+    lo = max(0, lo)
+    hi = min(len(text), hi)
+    best: Optional[int] = None
+    best_rank = -1
+    best_dist = 0
+    for i in range(lo, hi):
+        ch = text[i]
+        if ch == ";":
+            rank, pos = _SEPARATOR_SEMICOLON_RANK, i + 1
+        elif ch == "|":
+            rank, pos = _SEPARATOR_PIPE_RANK, i
+        elif ch == ",":
+            rank, pos = _SEPARATOR_COMMA_RANK, i + 1
+        elif ch.isspace():
+            rank, pos = _SEPARATOR_SPACE_RANK, i + 1
+        else:
+            continue
+        if pos < lo or pos > hi:
+            continue
+        dist = abs(pos - target)
+        if rank > best_rank or (rank == best_rank and dist < best_dist):
+            best, best_rank, best_dist = pos, rank, dist
+    return best
+
+
 def _select_best_end_boundary(
     boundaries: List[_BoundaryPoint],
     lines: List[Tuple[int, int]],
@@ -695,7 +744,14 @@ def _select_best_end_boundary(
             priority=10,
         ))
     if not candidates:
-        return _nearest_line_end_before(lines, target_end)
+        # Пустой candidates означает ровно одно: ни AST-границы, ни конца строки
+        # в [search_from, search_to] нет — попадающий в интервал конец строки уже
+        # добавлен фолбэком выше. Возврат позиции вне интервала ломает инвариант
+        # вызывающего цикла (окно схлопывается, перекрытие перестаёт помещаться),
+        # поэтому идём вниз по лестнице: разделитель, затем жёсткий рез по цели.
+        # Назад за search_from не уходим никогда.
+        separator = _separator_cut(text, search_from, search_to, target_end)
+        return separator if separator is not None else target_end
 
     def score(bp: _BoundaryPoint) -> float:
         if bp.pos <= target_end:
@@ -810,7 +866,17 @@ def _ast_safe_sliding_ranges(
 
     ranges: List[Tuple[int, int]] = []
     start = 0
+    # Каждая итерация обязана двигать start минимум на (window - overlap); запас
+    # покрывает вырожденные окна, но не бесконечность.
+    max_iterations = 4 * (len(text) // max(1, window_chars - overlap_chars) + 8)
+    iterations = 0
     while start < len(text):
+        iterations += 1
+        if iterations > max_iterations:
+            raise SplitProgressError(
+                f"ast_safe_sliding did not converge: len={len(text)}, "
+                f"start={start}, iterations={iterations}"
+            )
         target_end = min(len(text), start + window_chars)
         if target_end >= len(text):
             end = len(text)
@@ -842,7 +908,7 @@ def _ast_safe_sliding_ranges(
         else:
             max_start = min(end - 1, target_start + start_tolerance)
 
-        start = _select_best_start_boundary(
+        next_start = _select_best_start_boundary(
             boundaries=boundary_points,
             lines=lines,
             text=text,
@@ -853,6 +919,13 @@ def _ast_safe_sliding_ranges(
             max_start=max_start,
             min_overlap_chars=min_overlap_chars,
         )
+        # Инвариант прогресса. Все ветки отбора старта могут отдать точку вне
+        # (start, end] — например когда min_overlap делает интервал
+        # [min_start, max_start] пустым. Тогда следующий unit начинается ровно на
+        # границе текущего: перекрытия нет, но и разрыва (потери кода) тоже нет.
+        if not (start < next_start <= end):
+            next_start = end
+        start = next_start
 
     return _dedupe_ranges(ranges)
 

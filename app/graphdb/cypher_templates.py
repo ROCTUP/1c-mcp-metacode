@@ -693,6 +693,11 @@ ON CREATE SET
     r.project_name = row.project_name,
     r.config_name  = row.config_name
 SET r.name            = row.name,
+    // Lowercased copies for search predicates: `toLower(r.name) = ...` cannot use an index
+    // (Neo4j has no functional indexes), so the lowering is done once here at write time.
+    // Plain toLower only — no ё/space/punctuation folding, that would change match results.
+    r.name_norm       = toLower(coalesce(row.name, '')),
+    r.signature_norm  = toLower(coalesce(row.signature, '')),
     r.routine_type    = row.routine_type,
     r.export          = coalesce(row.export, false),
     r.params_text     = coalesce(row.params_text, ''),
@@ -1009,6 +1014,16 @@ RETURN r.id AS routine_id,
        r.export AS export,
        r.file_path AS file_path,
        r.line AS line
+"""
+
+# Все Routine id одной конфигурации. Нужен config-delete подготовке: множество
+# из графа шире serving-множества (routines с пустым телом и исключённые
+# политикой BSL в units не попадают), и именно оно позволяет доказать
+# `serving_ids ⊆ graph_ids` и снять residual-строки прогресса без остатка.
+CYPHER_FETCH_ROUTINE_IDS_FOR_CONFIG = """
+MATCH (r:Routine)
+WHERE r.project_name = $project_name AND r.config_name = $config_name
+RETURN r.id AS routine_id
 """
 
 # Lightweight pass restricted to a fixed set of routine_ids — used for

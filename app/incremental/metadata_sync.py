@@ -23,6 +23,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from config import settings
 
 from .child_identity import ChildGraphImpact, resolve_child_graph_identity
+from .extension_scope_cleanup import (
+    ExtensionCleanupRequest,
+    ExtensionDiscoveryEvidence,
+    ExtensionScopeCleanupCoordinator,
+)
 from .hashing import (
     ChildDomainImpact,
     build_object_snapshot,
@@ -32,7 +37,12 @@ from .hashing import (
     compute_object_hash,
 )
 from .report import AdoptedFromImpact, IncrementalReport
-from .state import IncrementalLoadingState
+from .state import (
+    CLEANUP_REASON_CONFIGURATION_RENAMED,
+    CLEANUP_REASON_DIRECTORY_REMOVED,
+    CLEANUP_REASON_STRUCTURE_INVALID,
+    IncrementalLoadingState,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1019,94 +1029,111 @@ def diff_and_apply_configuration(
 # --------------------------------------------------------------------
 
 
-# Labels дочерних узлов расширения с обязательным полем `config_name`.
-# `Configuration` сюда НЕ входит — у неё нет `config_name`, удаляется отдельно по
-# `qualified_name`. См. план §7.
-_EXT_CHILD_LABELS: Tuple[str, ...] = (
-    "MetadataCategory",
-    "MetadataObject",
-    "Attribute",
-    "TabularPart",
-    "Resource",
-    "Dimension",
-    "Form",
-    "Command",
-    "Layout",
-    "Characteristic",
-    "EnumValue",
-    "UrlTemplate",
-    "UrlMethod",
-    "JournalGraph",
-    "PredefinedItem",
-    "AccountingFlag",
-    "DimensionAccountingFlag",
-)
+def _recover_ext_config_qn_from_graph(
+    *, loader: Any, project_name: str, ext_dir_name: str
+) -> Optional[str]:
+    """Восстановить QN конфигурации расширения из графа, если state его потерял.
 
-
-def _apply_ext_removed(
-    *,
-    loader: Any,
-    state: IncrementalLoadingState,
-    source_scope: str,
-    project_name: str,
-    ext_graph_config_name: str,
-) -> None:
-    """Снести всё, что относится к scope расширения.
-
-    Используется в трёх случаях:
-    - удалён каталог расширения (top-level deletion);
-    - валидация структуры расширения провалилась И scope существует;
-    - rename конфигурации расширения внутри `<ext_dir>` (старый scope сносится,
-      потом инициализируется заново под новым QN).
-
-    `ext_graph_config_name` — имя конфигурации с `$ext$` (НЕ имя каталога).
-    Извлекается из `state.get_extension_scope_config_qn(scope)` для удаления-после-baseline.
+    Read-only. Возвращает QN только при ЕДИНСТВЕННОМ кандидате: имя каталога и
+    имя конфигурации расширения не связаны напрямую (`Config$ext$Имя` задаётся
+    внутри выгрузки), поэтому при нескольких расширениях сопоставить каталог с
+    конфигурацией нечем. Угадывать здесь нельзя — ценой ошибки будет физическое
+    удаление не того расширения.
     """
-    if not ext_graph_config_name:
-        # На всякий случай — без graph config name мы не можем точечно почистить graph.
-        # Просто чистим state, чтобы избежать вечного reapply одной и той же ошибки.
-        state.delete_scope(source_scope)
-        return
+    if loader is None or getattr(loader, "driver", None) is None:
+        return None
+    try:
+        with loader.driver.session(database=settings.neo4j_database) as session:
+            rows = session.run(
+                "MATCH (:Project {name: $project_name})-[:HAS_CONFIGURATION]->"
+                "(c:Configuration {is_extension: true}) "
+                "RETURN c.qualified_name AS qn",
+                project_name=project_name,
+            ).values()
+    except Exception:  # noqa: BLE001
+        logger.exception(
+            "Cannot probe graph for extension configuration QN (ext=%s)", ext_dir_name
+        )
+        return None
 
-    ext_cfg_qn = _configuration_qn(project_name, ext_graph_config_name)
-
-    with loader.driver.session(database=settings.neo4j_database) as session:
-        # 1. Дочерние узлы по config_name (batched).
-        for label in _EXT_CHILD_LABELS:
-            cypher = (
-                f"MATCH (n:{label}) "
-                "WHERE n.project_name = $project_name AND n.config_name = $ext_cfg_name "
-                "DETACH DELETE n"
-            )
-            try:
-                session.run(
-                    cypher,
-                    project_name=project_name,
-                    ext_cfg_name=ext_graph_config_name,
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning(
-                    "_apply_ext_removed: %s DETACH DELETE failed: %s", label, e
-                )
-
-        # 2. Сам Configuration node (у него НЕТ config_name — фильтр по qualified_name).
-        try:
-            session.run(
-                "MATCH (c:Configuration {qualified_name: $cfg_qn}) DETACH DELETE c",
-                cfg_qn=ext_cfg_qn,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(
-                "_apply_ext_removed: Configuration DETACH DELETE failed: %s", e
-            )
-
-    # 3. Snapshot scope-а из SQLite.
-    state.delete_scope(source_scope)
-    logger.info(
-        "Extension scope removed: scope=%s ext_graph_config_name=%s",
-        source_scope,
-        ext_graph_config_name,
+    candidates = sorted({r[0] for r in rows if r and r[0]})
+    if len(candidates) == 1:
+        logger.warning(
+            "Extension %s: configuration QN missing from state, recovered %s "
+            "from graph (single extension in project)",
+            ext_dir_name, candidates[0],
+        )
+        return candidates[0]
+    logger.error(
+        "Extension %s: configuration QN missing from state and %d extension "
+        "configurations exist in the graph (%s) — cannot disambiguate, cleanup "
+        "deferred. Run FULL_METADATA_RELOAD=true to rebuild the baseline.",
+        ext_dir_name, len(candidates), candidates,
     )
+    return None
+
+
+def _enqueue_ext_cleanup(
+    *,
+    coordinator: Any,
+    state: IncrementalLoadingState,
+    report: IncrementalReport,
+    source_scope: str,
+    source_mode: str,
+    ext_dir_name: str,
+    project_name: str,
+    reason: str,
+    config_qn: Optional[str] = None,
+    loader: Any = None,
+) -> bool:
+    """Поставить extension scope в очередь на удаление.
+
+    Заменяет прежний `_apply_ext_removed`, который чистил граф по жёсткому
+    списку labels (мимо Module/Routine/RoutineCodeUnit и внутренностей форм),
+    глотал ошибки Neo4j и всё равно сносил state, теряя retry identity.
+
+    `config_qn` передаётся явно только для rename — там нужен СТАРЫЙ QN, а в
+    `configuration_state` он к моменту вызова уже может быть неактуален.
+
+    Без известного `config_qn` очистка невозможна: точечно чистить граф нечем.
+    Тогда state НЕ сносится (иначе scope исчез бы, а orphan-подграф остался),
+    ошибка идёт в report, и scope остаётся на следующий цикл.
+    """
+    if config_qn is None:
+        config_qn = state.get_extension_scope_config_qn(source_scope) or ""
+    if not config_qn:
+        # State потерял QN (например, частичный baseline от прежних версий).
+        # Прежде чем сдаваться, спрашиваем граф: если расширение в проекте ровно
+        # одно, QN восстанавливается однозначно и удаление можно довести до
+        # конца. Несколько кандидатов означают, что выбрать не из чего — там
+        # fail closed, потому что удалить не то расширение хуже, чем не удалить
+        # ничего.
+        config_qn = _recover_ext_config_qn_from_graph(
+            loader=loader, project_name=project_name, ext_dir_name=ext_dir_name,
+        ) or ""
+    if not config_qn:
+        msg = (
+            f"extension {ext_dir_name}: cannot determine configuration QN for "
+            f"{source_scope}; scope kept for retry (run FULL_METADATA_RELOAD=true "
+            "if this persists)"
+        )
+        logger.error(msg)
+        report.errors.append(msg)
+        return False
+
+    prefix = f"{project_name}/"
+    config_name = config_qn[len(prefix):] if config_qn.startswith(prefix) else config_qn
+    coordinator.enqueue(
+        ExtensionCleanupRequest(
+            source_scope=source_scope,
+            source_mode=source_mode,
+            ext_dir_name=ext_dir_name,
+            config_qn=config_qn,
+            config_name=config_name,
+            reason=reason,
+        )
+    )
+    return True
 
 
 def _refresh_extension_links(
@@ -1273,9 +1300,23 @@ class MetadataIncrementalSync:
     def __init__(
         self, loader: Any, state: IncrementalLoadingState,
         *, use_startup_probe_for_vectors: bool = False,
+        cleanup_coordinator: Any = None,
     ) -> None:
         self.loader = loader
         self.state = state
+        # Владелец durable-очереди удаления extension scope. Scheduler создаёт
+        # его один раз на цикл (с lease для heartbeat); при отсутствии —
+        # создаём свой, чтобы прямые вызовы sync вне scheduler тоже работали.
+        #
+        # Для собственного координатора границу цикла держит `run()`: у него
+        # есть cycle-local состояние, и при повторном вызове на том же объекте
+        # sync без явного сброса scope остался бы заблокированным навсегда.
+        # У внедрённого координатора владелец границы — scheduler, поэтому
+        # трогать его здесь нельзя: он мог пометить scope ещё до `run()`.
+        self._owns_cleanup_coordinator = cleanup_coordinator is None
+        self.cleanup_coordinator = cleanup_coordinator or ExtensionScopeCleanupCoordinator(
+            loader, state, settings,
+        )
         # Startup cycles set this so vector DDL (via create_indexes inside
         # apply/diff funcs) uses the bounded embedding probe. Scheduled cycles
         # leave it False. Carried as instance state to avoid threading a flag
@@ -1284,6 +1325,9 @@ class MetadataIncrementalSync:
         self._use_startup_probe_for_vectors = bool(use_startup_probe_for_vectors)
 
     def run(self, settings_obj: Any) -> IncrementalReport:
+        if self._owns_cleanup_coordinator:
+            # Для standalone-вызова один `run()` и есть цикл.
+            self.cleanup_coordinator.begin_cycle()
         source_type = getattr(settings_obj, "metadata_source", "txt")
         if source_type == "txt":
             metadata_dir = settings_obj.metadata_directory
@@ -1448,16 +1492,23 @@ class MetadataIncrementalSync:
     ) -> None:
         """TXT-инкрементал расширений.
 
-        Шаги (см. план §5):
-        1. extensions_directory не существует → выход.
-        2. Top-level diff: scope-ы в state vs фактические каталоги на диске →
-           удалённые получают `_apply_ext_removed` с graph cfg name из state.
-        3. Для каждого фактического `<ext_dir>`:
-           - validation структуры (`metadata/` + единственный `.txt`);
-           - при failed validation И существующем scope — `_apply_ext_removed`;
-           - manifest-fast-path (size+mtime → hash);
-           - при изменении hash или пустом scope — full reparse + rename detect +
-             diff_and_apply + refresh ext links + manifest/stage update.
+        Два прохода (см. план, этап 7):
+
+        1. extensions_directory не существует → выход (fail-closed: временно не
+           примонтированный volume не должен выглядеть как массовое удаление).
+        2. **Проход 1 — только наблюдение.** Top-level diff и валидация
+           структуры каждого каталога; заполняется `ExtensionDiscoveryEvidence`;
+           проблемные scope ставятся в очередь на удаление. Ничего не грузится.
+        3. **Между проходами** — `resume_pending` с evidence: superseded-записи
+           снимаются, остальные продвигаются по стадиям.
+        4. **Проход 2 — загрузка.** Только для каталогов без незавершённого
+           cleanup: manifest-fast-path, парсинг, rename detect, diff_and_apply,
+           GUID, refresh ext links, manifest/stage.
+
+        Наблюдение нельзя объединить с загрузкой под общим гейтом: именно
+        прохождение per-directory участка накапливает подтверждения для
+        `structure_invalid`, и гейт в начале обработки навсегда заморозил бы
+        запись на `confirmations = 1`.
         """
         extensions_dir = getattr(settings_obj, "extensions_directory", None)
         if extensions_dir is None or not extensions_dir.exists():
@@ -1465,63 +1516,89 @@ class MetadataIncrementalSync:
 
         # base config name нужен для refresh ADOPTED_FROM / EXTENDS.
         base_cfg_name = self._detect_base_config_name("txt")
+        coordinator = self.cleanup_coordinator
 
         ext_dirs = [d for d in extensions_dir.iterdir() if d.is_dir()]
         on_disk_names = {d.name for d in ext_dirs}
-
-        # 2. Top-level удалённые каталоги.
         known_scopes = self.state.list_extension_scopes("txt")
+
+        # ---------- Проход 1: наблюдение + enqueue ----------
+        revalidated: Set[str] = set()
+        # rel_path валидного .txt, чтобы проход 2 не повторял glob.
+        valid_txt_by_dir: Dict[str, Path] = {}
+
         for scope in sorted(known_scopes):
             ext_dir_name = scope.split("txt_ext:", 1)[-1]
             if ext_dir_name in on_disk_names:
                 continue
-            ext_graph_config_name = self._extract_ext_cfg_name_from_state(
-                scope, project_name
-            )
-            _apply_ext_removed(
-                loader=self.loader,
+            _enqueue_ext_cleanup(
+                coordinator=coordinator,
                 state=self.state,
+                report=report,
                 source_scope=scope,
+                source_mode="txt",
+                ext_dir_name=ext_dir_name,
                 project_name=project_name,
-                ext_graph_config_name=ext_graph_config_name,
+                reason=CLEANUP_REASON_DIRECTORY_REMOVED,
+                loader=self.loader,
             )
 
-        # 3. Per-extension.
         for ext_dir in sorted(ext_dirs, key=lambda d: d.name):
             ext_dir_name = ext_dir.name
             source_scope = f"txt_ext:{ext_dir_name}"
-            scope_exists = source_scope in known_scopes
+            ext_metadata_dir = ext_dir / "metadata"
+
+            txt_files = (
+                list(ext_metadata_dir.glob("*.txt")) if ext_metadata_dir.exists() else []
+            )
+            if len(txt_files) == 1:
+                revalidated.add(ext_dir_name)
+                valid_txt_by_dir[ext_dir_name] = txt_files[0]
+                continue
+            # Структура невалидна. Enqueue поднимает confirmations — очистка
+            # произойдёт только со второго подтверждения подряд.
+            if source_scope in known_scopes:
+                _enqueue_ext_cleanup(
+                    coordinator=coordinator,
+                    state=self.state,
+                    report=report,
+                    source_scope=source_scope,
+                    source_mode="txt",
+                    ext_dir_name=ext_dir_name,
+                    project_name=project_name,
+                    reason=CLEANUP_REASON_STRUCTURE_INVALID,
+                    loader=self.loader,
+                )
+
+        # ---------- Между проходами: продвинуть очередь ----------
+        coordinator.resume_pending(
+            report,
+            evidence=ExtensionDiscoveryEvidence(
+                present_ext_dirs=on_disk_names,
+                revalidated_ext_dirs=revalidated,
+            ),
+        )
+
+        # ---------- Проход 2: загрузка ----------
+        for ext_dir in sorted(ext_dirs, key=lambda d: d.name):
+            ext_dir_name = ext_dir.name
+            if ext_dir_name not in valid_txt_by_dir:
+                continue
+            source_scope = f"txt_ext:{ext_dir_name}"
+            if coordinator.has_pending_cleanup(source_scope):
+                # Пока cleanup не финализирован, писать в этот scope нельзя:
+                # `delete_scope` бьёт по каталогу, а не по config_qn, и снёс бы
+                # baseline нового поколения.
+                logger.info(
+                    "TXT extension %s skipped: cleanup pending for %s",
+                    ext_dir_name, source_scope,
+                )
+                report.notes.append(f"ext {ext_dir_name}: skipped, cleanup pending")
+                continue
 
             ext_metadata_dir = ext_dir / "metadata"
             ext_code_dir = ext_dir / "code"
-
-            # Validation as full load does.
-            if not ext_metadata_dir.exists():
-                if scope_exists:
-                    _apply_ext_removed(
-                        loader=self.loader,
-                        state=self.state,
-                        source_scope=source_scope,
-                        project_name=project_name,
-                        ext_graph_config_name=self._extract_ext_cfg_name_from_state(
-                            source_scope, project_name
-                        ),
-                    )
-                continue
-            txt_files = list(ext_metadata_dir.glob("*.txt"))
-            if not txt_files or len(txt_files) > 1:
-                if scope_exists:
-                    _apply_ext_removed(
-                        loader=self.loader,
-                        state=self.state,
-                        source_scope=source_scope,
-                        project_name=project_name,
-                        ext_graph_config_name=self._extract_ext_cfg_name_from_state(
-                            source_scope, project_name
-                        ),
-                    )
-                continue
-            txt_path = txt_files[0]
+            txt_path = valid_txt_by_dir[ext_dir_name]
             rel_path = txt_path.name
 
             try:
@@ -1591,14 +1668,39 @@ class MetadataIncrementalSync:
             # Rename detection: сравниваем full QN с full QN.
             old_qn = self.state.get_extension_scope_config_qn(source_scope)
             if old_qn is not None and old_qn != parsed_qn:
-                old_ext_cfg_name = old_qn.split("/", 1)[1] if "/" in old_qn else old_qn
-                _apply_ext_removed(
-                    loader=self.loader,
+                # Rename виден только здесь — нужен парсинг Configuration,
+                # поэтому в проходе 1 его поймать нельзя.
+                _enqueue_ext_cleanup(
+                    coordinator=coordinator,
                     state=self.state,
+                    report=report,
                     source_scope=source_scope,
+                    source_mode="txt",
+                    ext_dir_name=ext_dir_name,
                     project_name=project_name,
-                    ext_graph_config_name=old_ext_cfg_name,
+                    reason=CLEANUP_REASON_CONFIGURATION_RENAMED,
+                    config_qn=old_qn,
+                    loader=self.loader,
                 )
+                coordinator.resume_pending(
+                    report,
+                    evidence=ExtensionDiscoveryEvidence(
+                        present_ext_dirs=on_disk_names,
+                        revalidated_ext_dirs=revalidated,
+                    ),
+                )
+                if coordinator.has_pending_cleanup(source_scope):
+                    # Старое поколение ещё не снесено до конца (например, BSL
+                    # стадия законно отложена). Загружать новое сейчас нельзя:
+                    # его baseline уничтожил бы будущий `delete_scope`.
+                    logger.info(
+                        "TXT extension %s: rename cleanup not finalized, deferring load",
+                        ext_dir_name,
+                    )
+                    report.notes.append(
+                        f"ext {ext_dir_name}: rename deferred until cleanup finalizes"
+                    )
+                    continue
 
             # Sub-report для этого расширения.
             sub_report = IncrementalReport(source_type=source_scope)
@@ -1665,22 +1767,6 @@ class MetadataIncrementalSync:
                     except Exception:
                         pass
             report.extension_reports[ext_dir_name] = sub_report
-
-    def _extract_ext_cfg_name_from_state(
-        self, source_scope: str, project_name: str
-    ) -> str:
-        """Извлечь `ext_graph_config_name` из `configuration_state.configuration_qn`.
-
-        Возвращает пустую строку если scope ещё не имеет stored QN — caller должен
-        учесть это (без graph cfg name `_apply_ext_removed` пропустит graph cleanup).
-        """
-        full_qn = self.state.get_extension_scope_config_qn(source_scope)
-        if not full_qn:
-            return ""
-        prefix = f"{project_name}/"
-        if full_qn.startswith(prefix):
-            return full_qn[len(prefix) :]
-        return full_qn
 
     def _detect_base_config_name(self, source_type: str) -> str:
         """Определить имя базовой конфигурации из state.

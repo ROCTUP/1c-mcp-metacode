@@ -27,9 +27,11 @@ Two-tokenizer contract (plan decision #6):
 """
 from __future__ import annotations
 
+import logging
 import re
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -38,6 +40,8 @@ from .bsl_code_scorers import tokenize, tokenize_1c_light
 from .bsl_code_search_policy import is_regulated_report as _is_regulated_report
 from .bsl_code_split import slice_body, split_routine
 
+
+logger = logging.getLogger(__name__)
 
 DOC_FIELD_KIND = "_doc"
 FIELD_KINDS: Tuple[str, ...] = ("symbol", "object", "form", "metadata_type", "path")
@@ -54,6 +58,13 @@ STRUCTURAL_FTS_TABLES: Tuple[str, ...] = (
     "bsl_code_identifiers_fts",
 )
 
+# CONTRIBUTION-AFFECTING CONSTANTS. Меняют вклад routine в corpus_idf/corpus_stats,
+# но НЕ входят в `_compute_config_fingerprint` напрямую — их покрывает
+# `bsl_code_units_version`. Изменение этих весов (как и `_build_search_text` /
+# `_unit_context` / `_build_fields` ниже) обязано сопровождаться повышением
+# `BSL_CODE_UNITS_VERSION`: иначе обратное вычитание обоих scoped-путей —
+# routine delta и config delete — посчитает вклад по новой формуле и вычтет
+# не то, что было добавлено старой.
 _METADATA_WEIGHT = 6
 _METADATA_SYMBOL_WEIGHT = 1.0
 
@@ -327,14 +338,21 @@ def process_batch(
         split_started = time.perf_counter() if debug_data is not None else 0.0
         try:
             units = split_routine(body, strategy)
-        except Exception:
+        except Exception as e:
             if debug_data is not None:
                 debug_data["split_ms"] += (
                     time.perf_counter() - split_started
                 ) * 1000.0
-            # Per the plan, split failures stay non-fatal per routine
-            # so the rest of the batch still produces useful sidecar data.
+            # Split failures stay non-fatal per routine so the rest of the batch
+            # still produces useful sidecar data. Логируем адрес: без него
+            # ненулевой split_failed невозможно связать с конкретным телом.
             split_failed += 1
+            logger.warning(
+                "BSL Phase A: split failed for routine_id=%s rel_path=%s "
+                "body_chars=%d — %s: %s",
+                rid, (r.get("file_path") or "").strip(), len(body),
+                type(e).__name__, str(e)[:300],
+            )
             routines_done.append({
                 "routine_id": rid, "body_hash": body_hash, "units_written": 0,
             })
@@ -390,37 +408,15 @@ def process_batch(
                 for m in _HEADER_RE.finditer(excerpt):
                     routine_headers.append(m.group(1).strip())
 
-            # --- IDF / stats deltas: tokenize per the plan two-tokenizer
-            # contract: tokenize_1c_light for IDF/stats, base tokenize is
-            # already applied for FTS payloads above.
-            doc_tokens = _tokenize_1c_light_timed(fts_text or "")
-            uniq_doc = set(doc_tokens)
-            for t in uniq_doc:
-                routine_idf[DOC_FIELD_KIND][t] += 1
-            routine_stats[DOC_FIELD_KIND][0] += 1
-            routine_stats[DOC_FIELD_KIND][1] += len(doc_tokens)
-
-            for fk in FIELD_KINDS:
-                field_value = fields.get(fk, "") or ""
-                field_tokens = _tokenize_1c_light_timed(field_value)
-                uniq = set(field_tokens)
-                for t in uniq:
-                    routine_idf[fk][t] += 1
-                routine_stats[fk][0] += 1
-                routine_stats[fk][1] += len(field_tokens)
-
-            # Drift 3 fix: body field IDF/stats. _build_fields() does NOT
-            # return "body" (raw BSL must not be persisted in
-            # bsl_code_unit_fields), but the hybrid scorer's field_idf for
-            # field_kind='body' must still be populated. We tokenize the
-            # excerpt directly here. Worker FIELD_KINDS stays metadata-only
-            # to avoid double-counting in the loop above.
-            body_tokens = _tokenize_1c_light_timed(excerpt or "")
-            uniq_body = set(body_tokens)
-            for t in uniq_body:
-                routine_idf["body"][t] += 1
-            routine_stats["body"][0] += 1
-            routine_stats["body"][1] += len(body_tokens)
+            # --- IDF / stats deltas: единый аккумулятор, общий с
+            # `compute_contributions_for_ranges` (см. его docstring). Здесь
+            # он получает уже посчитанные `fts_text`/`fields`/`excerpt`, так
+            # что Phase A не платит вторую токенизацию.
+            _accumulate_unit_contribution(
+                routine_idf, routine_stats,
+                fts_text=fts_text, fields=fields, excerpt=excerpt,
+                tokenize_fn=_tokenize_1c_light_timed,
+            )
 
             unit_rows.append({
                 "unit": {
@@ -542,44 +538,97 @@ def process_batch(
     return result
 
 
-def compute_contributions_from_routine_record(
+def _accumulate_unit_contribution(
+    routine_idf: Dict[str, Dict[str, int]],
+    routine_stats: Dict[str, List[int]],
+    *,
+    fts_text: str,
+    fields: Dict[str, str],
+    excerpt: str,
+    tokenize_fn=tokenize_1c_light,
+) -> None:
+    """Вклад ОДНОГО unit в per-routine аккумуляторы — единственная реализация.
+
+    Вызывается и из `process_batch` (полная сборка), и из
+    `compute_contributions_for_ranges` (обратное вычитание). Оба передают уже
+    построенные тексты, поэтому формула не дублируется и лишней токенизации на
+    горячем пути Phase A не появляется.
+
+    Два токенизатора по контракту плана: FTS payload'ы строятся базовым
+    `tokenize` выше по стеку, а IDF/stats — только `tokenize_1c_light`.
+    `body` не приходит в `fields` (raw BSL не персистится в
+    `bsl_code_unit_fields`), но field_kind='body' в IDF нужен hybrid-скореру,
+    поэтому excerpt токенизируется здесь отдельно.
+    """
+    doc_tokens = tokenize_fn(fts_text or "")
+    for t in set(doc_tokens):
+        routine_idf[DOC_FIELD_KIND][t] += 1
+    routine_stats[DOC_FIELD_KIND][0] += 1
+    routine_stats[DOC_FIELD_KIND][1] += len(doc_tokens)
+
+    for fk in FIELD_KINDS:
+        field_tokens = tokenize_fn(fields.get(fk, "") or "")
+        for t in set(field_tokens):
+            routine_idf[fk][t] += 1
+        routine_stats[fk][0] += 1
+        routine_stats[fk][1] += len(field_tokens)
+
+    body_tokens = tokenize_fn(excerpt or "")
+    for t in set(body_tokens):
+        routine_idf["body"][t] += 1
+    routine_stats["body"][0] += 1
+    routine_stats["body"][1] += len(body_tokens)
+
+
+class ContributionComputationError(RuntimeError):
+    """Вклад посчитать не удалось — это НЕ то же самое, что нулевой вклад.
+
+    Отличие принципиально для обратного вычитания: routine с непустым телом и
+    живыми units, чей вклад «посчитался» как пустой, привела бы к удалению её
+    строк без уменьшения corpus counters, и underflow-guard этого не заметил бы
+    (вычитается ноль). Поэтому ядро бросает, а не возвращает пустой результат.
+    """
+
+
+@dataclass
+class RoutineContribution:
+    idf: Dict[str, Dict[str, int]]
+    stats: Dict[str, Tuple[int, int]]
+    unit_count: int
+
+
+def compute_contributions_for_ranges(
     record: Dict[str, Any],
-    strategy: str,
+    ranges: Sequence[Any],
     *,
     sign: int = 1,
-) -> Tuple[Dict[str, Dict[str, int]], Dict[str, Tuple[int, int]]]:
-    """Same idf/stats contributions that `process_batch([record], ...)` would
-    emit for a positive contribution, but for a single routine and without
-    persisting units/methods/fragments.
+) -> RoutineContribution:
+    """Ядро расчёта вклада одной routine по ГОТОВОМУ разбиению.
 
-    Used to compute reverse counters from a snapshot of the OLD routine
-    record before scoped apply rewrites/deletes its persisted units. The
-    snapshot is captured in `_apply_bsl` step 4.5 before `load_bsl_signatures`
-    overwrites the Neo4j body, so the OLD context (rel_path, owner_qn, name,
-    etc.) is still available at that point.
+    Splitter здесь не вызывается: `ranges` — это последовательность `UnitRange`,
+    полученная либо от `split_routine` (сборка и routine-level delta), либо из
+    `bsl_code_units` serving epoch (config delete). Второй источник обязателен
+    для удаления конфигурации, потому что `split_routine` не является чистой
+    функцией от `(body, strategy)`: границы зависят от доступности
+    tree-sitter/SDBL в момент вызова, а она не входит в config fingerprint.
+    Пересчёт разбиения дал бы другие окна (они перекрываются) и, значит, другой
+    вклад при том же теле.
 
-    Returns (idf, stats) where:
-        idf:   {field_kind: {token: df}}  (df ≥ 0 if sign=+1, ≤ 0 if sign=-1)
-        stats: {field_kind: (doc_count, total_length)} (same sign convention)
-
-    Symmetry contract: calling this with sign=+1 on the same record as
-    `process_batch` produces identical per-routine totals (matched against
-    the per-routine aggregator inside `process_batch`). Reverse counters
-    are simply produced with sign=-1 OR by inverting the +1 result.
+    Возвращает вклад со знаком `sign` и число обработанных units.
     """
     routine_idf: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
     routine_stats: Dict[str, List[int]] = defaultdict(lambda: [0, 0])
 
     body = record.get("body") or ""
+    units = list(ranges or ())
     if not body.strip():
-        return ({}, {})
-
-    try:
-        units = split_routine(body, strategy)
-    except Exception:
-        return ({}, {})
+        if units:
+            raise ContributionComputationError(
+                "empty body but non-empty unit partition"
+            )
+        return RoutineContribution({}, {}, 0)
     if not units:
-        return ({}, {})
+        raise ContributionComputationError("non-empty body but empty unit partition")
 
     module_kind = _MODULE_TYPE_TO_KIND.get(record.get("module_type") or "", "")
     rel_path = (record.get("file_path") or "").strip()
@@ -587,27 +636,12 @@ def compute_contributions_from_routine_record(
 
     for u in units:
         excerpt = slice_body(body, u)
-        fts_text = _build_search_text(excerpt, ctx, module_kind, rel_path)
-        fields = _build_fields(ctx, rel_path)
-
-        doc_tokens = tokenize_1c_light(fts_text or "")
-        for t in set(doc_tokens):
-            routine_idf[DOC_FIELD_KIND][t] += 1
-        routine_stats[DOC_FIELD_KIND][0] += 1
-        routine_stats[DOC_FIELD_KIND][1] += len(doc_tokens)
-
-        for fk in FIELD_KINDS:
-            field_tokens = tokenize_1c_light(fields.get(fk, "") or "")
-            for t in set(field_tokens):
-                routine_idf[fk][t] += 1
-            routine_stats[fk][0] += 1
-            routine_stats[fk][1] += len(field_tokens)
-
-        body_tokens = tokenize_1c_light(excerpt or "")
-        for t in set(body_tokens):
-            routine_idf["body"][t] += 1
-        routine_stats["body"][0] += 1
-        routine_stats["body"][1] += len(body_tokens)
+        _accumulate_unit_contribution(
+            routine_idf, routine_stats,
+            fts_text=_build_search_text(excerpt, ctx, module_kind, rel_path),
+            fields=_build_fields(ctx, rel_path),
+            excerpt=excerpt,
+        )
 
     if sign == 1:
         idf_out = {fk: dict(toks) for fk, toks in routine_idf.items()}
@@ -616,4 +650,10 @@ def compute_contributions_from_routine_record(
         s = int(sign)
         idf_out = {fk: {t: df * s for t, df in toks.items()} for fk, toks in routine_idf.items()}
         stats_out = {fk: (dc * s, tl * s) for fk, (dc, tl) in routine_stats.items()}
-    return (idf_out, stats_out)
+    return RoutineContribution(idf_out, stats_out, len(units))
+
+
+# Обёртки, пересчитывающей разбиение через `split_routine` ради обратного
+# вычитания, здесь намеренно нет. Единственный источник границ для вычитания —
+# сохранённое разбиение serving epoch: `split_routine` не является чистой функцией
+# от (body, strategy), см. докстринг `compute_contributions_for_ranges`.

@@ -11,13 +11,15 @@ import logging
 import math
 import re
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 from config import settings
 from graphdb.category_canon import canon_categories
+from graphdb.routine_substring_queries import SubstringTarget
 from graphdb.types import normalize_type_for_display
-from .neo4j_init import initialize_neo4j, get_loader
-from .queries import _run_query, apply_match, clamp_limit, clamp_offset
+from .neo4j_init import initialize_neo4j, get_loader, get_search_ready_loader
+from .queries import _run_query, apply_match, apply_match_norm, clamp_limit, clamp_offset
 from .resolvers import (
     ConfigScope,
     _canon_category_or_raw,
@@ -69,6 +71,21 @@ def _init_loader():
     if not initialize_neo4j():
         return None
     return get_loader()
+
+
+# Tools whose queries can reach a `Routine.name_norm` / `signature_norm` predicate must
+# take their loader from here instead of _init_loader, so they are gated while the search
+# schema migrates. Current consumers:
+#   search_bsl_routines   — mode=name / mode=signature / routine_name filter (any mode)
+#   get_bsl_routine_body  — routine_ref_type = name / signature
+#   get_bsl_modules       — routine_name filters
+#   find_form_links       — mode=events_handled_by_routine
+# Everything else keeps using _init_loader: those tools read MetadataObject, forms, rights
+# or Routine.id, and gating them on this migration would break unrelated features.
+# get_bsl_call_graph is deliberately absent — between_owners compares the canonical
+# owner_qn against idx_routine_owner_qn and reads no denormalized field.
+def _init_search_ready_loader():
+    return get_search_ready_loader()
 
 
 def _fmt(results: list, max_n: int) -> str:
@@ -1181,6 +1198,106 @@ WITH r,
       THEN {role: 'base', extensions: [x IN _ext_list WHERE x.extension_config_name IS NOT NULL]}
     ELSE null
   END AS interception"""
+
+
+class PageSourcePolicy(Enum):
+    """How the page subquery obtains and orders its rows.
+
+    DEFAULT — the caller supplies the whole row source (a MATCH or a fulltext CALL) and the
+    page is ordered by name/id, as before.
+
+    PROJECT_ORDERED_SCAN — the helper owns the row source: it emits the index hint, both
+    index predicates and the matching ORDER BY as one unit. They only work together. The
+    hint with the old `ORDER BY r.name, r.id` makes the query *slower* than no hint at all
+    (1636 ms vs 536 ms, 194 919 rows scanned) while still returning correct rows, so a
+    mismatched combination is a regression nothing but a benchmark would reveal. The caller
+    supplies only its own branch condition, never the ordering.
+    """
+
+    DEFAULT = "default"
+    PROJECT_ORDERED_SCAN = "project_ordered_scan"
+
+
+def _paged_routine_query(
+    source: str, extra: str, icp: str, mt: str, return_fields: str,
+    policy: PageSourcePolicy = PageSourcePolicy.DEFAULT,
+) -> str:
+    """Wrap a row source in a page subquery so enrichment runs on the page, not the match.
+
+    With DEFAULT, `source` is the complete row source ending in its leading WHERE predicate.
+    With PROJECT_ORDERED_SCAN, `source` is only this branch's boolean condition. `extra`
+    appends the common `AND ...` filters in both cases.
+
+    The outer ORDER BY is mandatory rather than cosmetic. `_shape_search_bsl_routines_result`
+    trims the page by position (`rows[:lim]`), and `_routine_interception_block` aggregates,
+    after which row order is not guaranteed — without the outer sort the lookahead row could
+    displace a row of the page and produce duplicates and gaps across offsets.
+    """
+    if policy is PageSourcePolicy.PROJECT_ORDERED_SCAN:
+        head = (
+            "MATCH (r:Routine)\n"
+            "USING INDEX r:Routine(project_name, name)\n"
+            "WHERE r.project_name = $project_name\n"
+            "  AND r.name IS NOT NULL\n"
+            f"  AND {source}"
+        )
+        # Must start with the index columns in index order, otherwise the planner does not
+        # recognise the ordering and falls back to materialising every match.
+        inner_order = "r.project_name, r.name, r.id"
+    else:
+        head = source
+        inner_order = "r.name, r.id"
+
+    return f"""
+CALL () {{
+{head}
+  {extra}
+  RETURN r ORDER BY {inner_order} SKIP $offset LIMIT $limit
+}}
+WITH r
+{icp}{mt}
+RETURN {return_fields}
+ORDER BY name, id
+""".strip()
+
+
+def _run_routine_query_with_fallback(loader, pn, params, build_cypher, src, scan_src):
+    """Run a substring query, retrying on the scan path if the accelerator misbehaves.
+
+    Catches any ProcedureCallFailed, not only Lucene parse errors: querying a fulltext
+    index that no longer exists raises the same code with a message carrying no Lucene
+    markers, and returning correct-but-slower rows beats returning an error. The verifier
+    predicate is identical in both sources, so the fallback cannot change the result.
+    """
+    try:
+        return _run_query(loader, build_cypher(src.cypher), {**params, **src.params}, pn)
+    except Exception as e:
+        code = getattr(e, "code", "") or ""
+        if src.used_index is None or code != "Neo.ClientError.Procedure.ProcedureCallFailed":
+            raise
+        logger.warning(
+            "Substring accelerator %s failed, falling back to scan: %s", src.used_index, e,
+        )
+        from .neo4j_init import invalidate_accelerator
+        invalidate_accelerator(src.used_index)
+        return _run_query(
+            loader, build_cypher(scan_src.cypher), {**params, **scan_src.params}, pn,
+        )
+
+
+def _substring_sources(target, text: str, param_name: str):
+    """Accelerated source (when its index is ONLINE) plus the scan source used as fallback."""
+    from graphdb.routine_substring_queries import build_routine_substring_source
+    from .neo4j_init import is_accelerator_ready
+
+    src = build_routine_substring_source(
+        target=target, text=text, param_name=param_name,
+        accelerator_ready=is_accelerator_ready(target),
+    )
+    scan_src = build_routine_substring_source(
+        target=target, text=text, param_name=param_name, accelerator_ready=False,
+    )
+    return src, scan_src
 
 
 def _module_type_block(has_interception: bool) -> str:
@@ -5365,9 +5482,10 @@ Modes:
 
 Use config to scope to one configuration or extension.
 """
-        loader = _init_loader()
+        loader = _init_search_ready_loader()
         if loader is None:
-            return "Error: Neo4j database connection not available."
+            return ("Error: Neo4j database connection or BSL routine search index "
+                    "not available yet.")
         try:
             pn = _resolve_project(project_name)
             config_name = resolve_config(loader, config, pn)
@@ -5423,11 +5541,11 @@ SKIP $offset LIMIT $limit
                     routine_filter = "r.id = $routine_id"
                 else:
                     params["routine_name"] = rref
-                    routine_filter = f"toLower(coalesce(r.name,'')) = toLower($routine_name)"
+                    routine_filter = "r.name_norm = toLower($routine_name)"
                     if routine_owner_ref and routine_owner_ref.strip():
                         owner_qn = normalize_qn_ref(loader, routine_owner_ref.strip(), pn, config_name)
                         params["owner_qn"] = owner_qn
-                        routine_filter += " AND toLower(coalesce(r.owner_qn,'')) = toLower($owner_qn)"
+                        routine_filter += " AND r.owner_qn = $owner_qn"
 
                 cypher = f"""
 CALL {{
@@ -5681,9 +5799,10 @@ call_context_mode: "none" (default) | "callees" | "callers" | "both".
   Adds caller/callee context for found routines, capped by call_context_limit (default 5),
   scoped to the same config as the search.
 """
-        loader = _init_loader()
+        loader = _init_search_ready_loader()
         if loader is None:
-            return "Error: Neo4j database connection not available."
+            return ("Error: Neo4j database connection or BSL routine search index "
+                    "not available yet.")
         try:
             pn = _resolve_project(project_name)
             config_name = resolve_config(loader, config, pn)
@@ -5728,14 +5847,17 @@ call_context_mode: "none" (default) | "callees" | "callers" | "both".
                 effective_export: Optional[bool],
                 directive_substring: bool = False,
             ) -> Tuple[List[str], Dict[str, Any]]:
-                _filters: List[str] = ["AND coalesce(r.owner_qn,'') STARTS WITH ($project_name + '/')"]
+                # owner_qn is never null and always carries the graph's canonical casing
+                # (normalize_qn_ref returns it), so compare the bare property: toLower()
+                # or coalesce() around it would rule out idx_routine_owner_qn.
+                _filters: List[str] = ["AND r.owner_qn STARTS WITH ($project_name + '/')"]
                 _params: Dict[str, Any] = {}
                 if owner_qn:
                     _params["owner_qn"] = owner_qn
                     _params["owner_qn_prefix"] = owner_qn + "/"
                     _filters.append(
-                        "AND (toLower(coalesce(r.owner_qn,'')) = toLower($owner_qn)"
-                        " OR toLower(coalesce(r.owner_qn,'')) STARTS WITH toLower($owner_qn_prefix))"
+                        "AND (r.owner_qn = $owner_qn"
+                        " OR r.owner_qn STARTS WITH $owner_qn_prefix)"
                     )
                 if routine_type:
                     _params["rtype"] = routine_type
@@ -5752,7 +5874,7 @@ call_context_mode: "none" (default) | "callees" | "callers" | "both".
                     _filters.append("AND coalesce(r.is_ssl_api,false) = $is_ssl_api")
                 if routine_name and routine_name.strip():
                     _params["rname"] = routine_name.strip()
-                    _filters.append("AND toLower(coalesce(r.name,'')) CONTAINS toLower($rname)")
+                    _filters.append("AND r.name_norm CONTAINS toLower($rname)")
                 if config_name:
                     _params["config_name"] = config_name
                     _filters.append("AND r.config_name = $config_name")
@@ -5848,14 +5970,12 @@ RETURN rid AS id,
                     extra = "\n  ".join(filters)
                     _icp_fb = _routine_interception_block() if has_extensions else ""
                     _mt_fb = _module_type_block(has_interception=has_extensions)
-                    cypher = f"""
-MATCH (r:Routine)
-WHERE toLower(coalesce(r.doc_description,'')) CONTAINS toLower($text)
-  {extra}
-{_icp_fb}{_mt_fb}
-RETURN {routine_fields}{interception_col}{module_type_col}
-ORDER BY name, id SKIP $offset LIMIT $limit
-""".strip()
+                    cypher = _paged_routine_query(
+                        "toLower(coalesce(r.doc_description,'')) CONTAINS toLower($text)",
+                        extra, _icp_fb, _mt_fb,
+                        f"{routine_fields}{interception_col}{module_type_col}",
+                        PageSourcePolicy.PROJECT_ORDERED_SCAN,
+                    )
                     results = _run_query(loader, cypher, params, pn)
                     if has_extensions:
                         results = _strip_null_interception(results)
@@ -5876,65 +5996,68 @@ ORDER BY name, id SKIP $offset LIMIT $limit
             _icp = _routine_interception_block() if has_extensions else ""
             _mt = _module_type_block(has_interception=has_extensions)
 
-            if mode == "name":
-                if not search_text or not search_text.strip():
-                    return "Error: search_text is required for mode='name'."
-                params["text"] = search_text.strip()
-                sm = (search_match or "exact").lower()
-                name_cond = apply_match("r.name", "text", sm)
-                cypher = f"""
-MATCH (r:Routine)
-WHERE {name_cond}
-  {extra}
-{_icp}{_mt}
-RETURN {routine_fields}{interception_col}{module_type_col}
-ORDER BY name, id SKIP $offset LIMIT $limit
-""".strip()
+            _return_fields = f"{routine_fields}{interception_col}{module_type_col}"
+            substring_src = substring_scan_src = None
+            page_policy = PageSourcePolicy.DEFAULT
 
-            elif mode == "signature":
+            if mode in ("name", "signature"):
                 if not search_text or not search_text.strip():
-                    return "Error: search_text is required for mode='signature'."
+                    return f"Error: search_text is required for mode='{mode}'."
                 params["text"] = search_text.strip()
-                sm = (search_match or "contains").lower()
-                sig_cond = apply_match("coalesce(r.signature,'')", "text", sm)
-                cypher = f"""
-MATCH (r:Routine)
-WHERE {sig_cond}
-  {extra}
-{_icp}{_mt}
-RETURN {routine_fields}{interception_col}{module_type_col}
-ORDER BY name, id SKIP $offset LIMIT $limit
-""".strip()
+                if mode == "name":
+                    sm = (search_match or "exact").lower()
+                    target = SubstringTarget.NAME
+                    field_norm = "r.name_norm"
+                else:
+                    sm = (search_match or "contains").lower()
+                    target = SubstringTarget.SIGNATURE
+                    field_norm = "r.signature_norm"
+
+                if sm == "contains":
+                    # The fulltext index only narrows; the CONTAINS verifier inside the
+                    # returned section is what decides, so the result is unchanged.
+                    substring_src, substring_scan_src = _substring_sources(
+                        target, params["text"], "text",
+                    )
+                    source_cypher = substring_src.cypher
+                else:
+                    # exact / starts_with are index seeks on the range index already;
+                    # a leading-wildcard fulltext query would only slow them down.
+                    source_cypher = (
+                        f"MATCH (r:Routine)\nWHERE {apply_match_norm(field_norm, 'text', sm)}"
+                    )
 
             elif mode == "unused":
                 if export:
                     filters.append("AND coalesce(r.export,false) = true")
-                extra2 = "\n  ".join(filters)
-                cypher = f"""
-MATCH (r:Routine)
-WHERE NOT ((:Routine)-[:CALLS]->(r))
-  AND NOT ((:FormEventAction)-[:HAS_HANDLER]->(r))
-  AND NOT ((:MetadataObject)-[:USES_HANDLER]->(r))
-  {extra2}
-{_icp}{_mt}
-RETURN {routine_fields}{interception_col}{module_type_col}
-ORDER BY name, id SKIP $offset LIMIT $limit
-""".strip()
+                    extra = "\n  ".join(filters)
+                # HAS_HANDLER is emitted by FormEventAction, Command and UrlMethod alike;
+                # the source label used to be pinned to FormEventAction, which reported
+                # every command and HTTP-service handler as unused. Any incoming
+                # HAS_HANDLER means something invokes the routine, so match it unlabelled.
+                source_cypher = """NOT ((:Routine)-[:CALLS]->(r))
+  AND NOT (()-[:HAS_HANDLER]->(r))
+  AND NOT ((:MetadataObject)-[:USES_HANDLER]->(r))"""
+                page_policy = PageSourcePolicy.PROJECT_ORDERED_SCAN
 
             elif mode == "exported":
-                cypher = f"""
-MATCH (r:Routine)
-WHERE coalesce(r.export,false) = true
-  {extra}
-{_icp}{_mt}
-RETURN {routine_fields}{interception_col}{module_type_col}
-ORDER BY name, id SKIP $offset LIMIT $limit
-""".strip()
+                source_cypher = "coalesce(r.export,false) = true"
+                page_policy = PageSourcePolicy.PROJECT_ORDERED_SCAN
 
             else:
                 return f"Error: unknown mode='{mode}'."
 
-            results = _run_query(loader, cypher, params, pn)
+            def _build(source: str) -> str:
+                return _paged_routine_query(
+                    source, extra, _icp, _mt, _return_fields, page_policy,
+                )
+
+            if substring_src is not None:
+                results = _run_routine_query_with_fallback(
+                    loader, pn, params, _build, substring_src, substring_scan_src,
+                )
+            else:
+                results = _run_query(loader, _build(source_cypher), params, pn)
             if has_extensions:
                 results = _strip_null_interception(results)
             results = _enrich_call_context(results, call_context_mode, call_context_limit, loader, pn, config_name)
@@ -5979,9 +6102,10 @@ limit/offset page matching routines for name/signature searches.
 body_limit/body_offset read a large routine body in chunks.
 config scopes to one configuration or extension.
 """
-        loader = _init_loader()
+        loader = _init_search_ready_loader()
         if loader is None:
-            return "Error: Neo4j database connection not available."
+            return ("Error: Neo4j database connection or BSL routine search index "
+                    "not available yet.")
         try:
             pn = _resolve_project(project_name)
             config_name = resolve_config(loader, config, pn)
@@ -6049,38 +6173,48 @@ config scopes to one configuration or extension.
                 params["routine_id"] = rref
                 cypher = f"""
 MATCH (r:Routine {{id:$routine_id}})
-WHERE coalesce(r.owner_qn,'') STARTS WITH ($project_name + '/'){config_filter}
+WHERE r.owner_qn STARTS WITH ($project_name + '/'){config_filter}
 {owner_setup}
 RETURN {select_fields}
 LIMIT 1
 """.strip()
             elif routine_ref_type == "name":
                 params["rname"] = rref
-                owner_filter = "\n  AND coalesce(r.owner_qn,'') STARTS WITH ($project_name + '/')"
+                owner_filter = "\n  AND r.owner_qn STARTS WITH ($project_name + '/')"
                 if owner_qn:
                     params["owner_qn"] = owner_qn
-                    owner_filter += "\n  AND toLower(coalesce(r.owner_qn,'')) = toLower($owner_qn)"
+                    owner_filter += "\n  AND r.owner_qn = $owner_qn"
                 cypher = f"""
 MATCH (r:Routine)
-WHERE toLower(coalesce(r.name,'')) = toLower($rname){owner_filter}{config_filter}
+WHERE r.name_norm = toLower($rname){owner_filter}{config_filter}
 {owner_setup}
 RETURN {select_fields}
 ORDER BY id SKIP $offset LIMIT $limit
 """.strip()
             elif routine_ref_type == "signature":
                 params["sig"] = rref
-                proj_filter = "\n  AND coalesce(r.owner_qn,'') STARTS WITH ($project_name + '/')"
-                cypher = f"""
-MATCH (r:Routine)
-WHERE toLower(coalesce(r.signature,'')) CONTAINS toLower($sig){proj_filter}{config_filter}
+                proj_filter = "\n  AND r.owner_qn STARTS WITH ($project_name + '/')"
+                sig_src, sig_scan_src = _substring_sources(
+                    SubstringTarget.SIGNATURE, rref, "sig",
+                )
+
+                def _build_sig(source: str) -> str:
+                    return f"""
+{source}{proj_filter}{config_filter}
 {owner_setup}
 RETURN {select_fields}
 ORDER BY id SKIP $offset LIMIT $limit
 """.strip()
+
+                results = _run_routine_query_with_fallback(
+                    loader, pn, params, _build_sig, sig_src, sig_scan_src,
+                )
+                cypher = None
             else:
                 return f"Error: unknown routine_ref_type='{routine_ref_type}'."
 
-            results = _run_query(loader, cypher, params, pn)
+            if cypher is not None:
+                results = _run_query(loader, cypher, params, pn)
             if routine_ref_type == "id":
                 # id lookup returns at most one row (LIMIT 1); pagination is disabled.
                 shaped = _shape_get_bsl_routine_body_result(
@@ -6597,9 +6731,10 @@ owner_ref accepts: full qualified_name, "Category.Object" /
 
 Use routine_name/routine_name_match to filter routines.
 """
-        loader = _init_loader()
+        loader = _init_search_ready_loader()
         if loader is None:
-            return "Error: Neo4j database connection not available."
+            return ("Error: Neo4j database connection or BSL routine search index "
+                    "not available yet.")
         try:
             pn = _resolve_project(project_name)
             config_name = resolve_config(loader, config, pn)
@@ -6673,7 +6808,7 @@ ORDER BY owner_name, name, id SKIP $offset LIMIT $limit
                 if routine_name and routine_name.strip():
                     params["rname"] = routine_name.strip()
                     rnm = (routine_name_match or "exact").lower()
-                    rn_filter = f"\n  AND {apply_match('r.name', 'rname', rnm)}"
+                    rn_filter = f"\n  AND {apply_match_norm('r.name_norm', 'rname', rnm)}"
 
                 _module_id_re = re.compile(
                     r'^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|[0-9a-f]{40})$',
@@ -6777,7 +6912,7 @@ LIMIT 1
                 if routine_name and routine_name.strip():
                     params["rname"] = routine_name.strip()
                     rnm = (routine_name_match or "exact").lower()
-                    rn_filter = f"\n  AND {apply_match('r.name', 'rname', rnm)}"
+                    rn_filter = f"\n  AND {apply_match_norm('r.name_norm', 'rname', rnm)}"
                 cypher = f"""
 MATCH (m:MetadataObject {{category_name:'ОбщиеМодули', project_name:$project_name{scope.metadata_map}}})-[:DECLARES]->(r:Routine)
 WHERE {mod_cond}{rn_filter}{r_config_filter}
@@ -7070,8 +7205,8 @@ RETURN DISTINCT {_edge_cols},
                 params["to_qn"] = to_qn
                 cypher = """
 MATCH (src:Routine)-[:CALLS]->(dst:Routine)
-WHERE toLower(coalesce(src.owner_qn,'')) = toLower($from_qn)
-  AND toLower(coalesce(dst.owner_qn,'')) = toLower($to_qn)
+WHERE src.owner_qn = $from_qn
+  AND dst.owner_qn = $to_qn
 RETURN src.id AS caller_id, coalesce(src.name,'') AS caller,
   dst.id AS callee_id, coalesce(dst.name,'') AS callee,
   coalesce(src.config_name,'') AS config_name

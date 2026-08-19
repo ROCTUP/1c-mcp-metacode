@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 
 
 class Settings(BaseSettings):
@@ -398,6 +398,11 @@ class Settings(BaseSettings):
     # description texts, so this is intentionally separate from embedding_batch_size.
     # Each API call receives at most this many code unit texts.
     bsl_code_embedding_batch_size: int = 16
+    # Аварийный выключатель scoped-удаления конфигурации из BSL sidecar.
+    # False → удаление расширения идёт прежним путём (purge + полная
+    # перестройка Phase A). Флаг влияет только на НОВЫЕ удаления: операция,
+    # уже пересёкшая destructive-границу, доводится до конца в любом случае.
+    bsl_config_delete_scoped_enabled: bool = True
 
     # Split / compression / prompt mode
     # Strategy name encodes per-routine slicing: small=whole routine,
@@ -451,6 +456,11 @@ class Settings(BaseSettings):
     # SQLite sidecar
     bsl_code_search_sqlite_path: str = "storage/search/bsl_code_search.sqlite"
     bsl_code_reindex_on_fingerprint_mismatch: bool = True
+    # Страничный кэш sidecar. Умолчание SQLite — 2 МБ, что на базе в сотни мегабайт
+    # даёт постоянный промах на записи в FTS-индексы. Память процесса, поэтому
+    # настраивается: подсистема уже меняет память на пропускную способность через
+    # workers / work_batch_max_mb / write_batch_units.
+    bsl_code_sqlite_cache_mb: int = 64
     bsl_code_phase_a_write_batch_units: int = 1000
     bsl_code_phase_a_module_commit_batch: int = 100
 

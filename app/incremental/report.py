@@ -161,6 +161,77 @@ class AdoptedFromImpact:
 
 
 @dataclass(slots=True)
+class ExtensionRemovalReport:
+    """Lifecycle-событие удаления extension scope за один цикл.
+
+    Отдельное поле, а не подмешивание Configuration QN в `deleted_qns`:
+    последнее семантически про `MetadataObject`.
+    """
+
+    source_scope: str
+    ext_dir_name: str
+    config_qn: str
+    reason: str
+    neo4j_nodes_deleted: int = 0
+    # Durable-маркер из очереди, а не счётчик этого цикла: именно по нему
+    # решается, обновлять ли кэш статистики. Retry после падения между батчами
+    # физически удалит 0 узлов, но кэш всё равно устарел.
+    graph_refresh_required: bool = False
+    bsl_routines_purged: int = 0
+    bsl_outcome: str = ""
+    summaries_quarantined: bool = False
+    finalized: bool = False
+    superseded: bool = False
+    resumed: bool = False
+    attempts: int = 0
+    error: Optional[str] = None
+    # Маршрут BSL-стадии. Главное, что должно быть видно одной строкой отчёта:
+    # обошлись ли scoped-вычитанием или заплатили полной перестройкой корпуса
+    # (и по какой именно причине).
+    bsl_mode: str = ""
+    bsl_routines_prepared: int = 0
+    bsl_routines_applied: int = 0
+    bsl_corpus_docs_decremented: int = 0
+    bsl_full_phase_a_required: bool = False
+    bsl_fallback_reason: str = ""
+
+    def summary(self) -> str:
+        if self.superseded:
+            return (
+                f"ext_cleanup superseded: scope={self.source_scope} "
+                f"config={self.config_qn} reason={self.reason}"
+            )
+        parts = [
+            f"scope={self.source_scope}",
+            f"config={self.config_qn}",
+            f"reason={self.reason}",
+            f"nodes_deleted={self.neo4j_nodes_deleted}",
+            f"bsl={self.bsl_outcome or 'n/a'}",
+            f"bsl_routines={self.bsl_routines_purged}",
+            f"summaries_quarantined={self.summaries_quarantined}",
+            f"finalized={self.finalized}",
+        ]
+        if self.bsl_mode:
+            parts.append(f"bsl_mode={self.bsl_mode}")
+        if self.bsl_routines_prepared:
+            parts.append(f"bsl_prepared={self.bsl_routines_prepared}")
+        if self.bsl_routines_applied:
+            parts.append(f"bsl_applied={self.bsl_routines_applied}")
+        if self.bsl_corpus_docs_decremented:
+            parts.append(f"bsl_docs_decremented={self.bsl_corpus_docs_decremented}")
+        parts.append(f"full_phase_a={self.bsl_full_phase_a_required}")
+        if self.bsl_fallback_reason:
+            parts.append(f"fallback_reason={self.bsl_fallback_reason}")
+        if self.resumed:
+            parts.append("resumed=True")
+        if self.attempts:
+            parts.append(f"attempts={self.attempts}")
+        if self.error:
+            parts.append(f"error={self.error}")
+        return "ext_cleanup: " + " ".join(parts)
+
+
+@dataclass(slots=True)
 class IncrementalReport:
     """Per-run report incremental loading.
 
@@ -215,6 +286,11 @@ class IncrementalReport:
     # Per-extension sub-reports: key = ext_dir_name, value = IncrementalReport scope-а.
     extension_reports: Dict[str, "IncrementalReport"] = field(default_factory=dict)
 
+    # Lifecycle удалённых extension scope за этот цикл (включая продолженные
+    # после рестарта) и число записей очереди, оставшихся незавершёнными.
+    removed_extension_scopes: List["ExtensionRemovalReport"] = field(default_factory=list)
+    pending_extension_cleanups: int = 0
+
     duration_seconds: float = 0.0
     errors: List[str] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
@@ -241,11 +317,23 @@ class IncrementalReport:
     @property
     def has_graph_changes(self) -> bool:
         """True если metadata-слой действительно изменил Neo4j-граф: added/changed/deleted
-        (рекурсивно по расширениям через has_changes), configuration_changed или непустой
-        post_linking_impact на корне либо в любом extension sub-report."""
+        (рекурсивно по расширениям через has_changes), configuration_changed, непустой
+        post_linking_impact на корне либо в любом extension sub-report, или удаление
+        extension scope.
+
+        Для удалений смотрим на durable `graph_refresh_required` из очереди, а не
+        на `neo4j_nodes_deleted` этого цикла: иначе финализация после рестарта
+        (узлы снёс упавший предыдущий цикл, повтор удалил 0) не обновила бы кэш
+        статистики, хотя counted counts уже устарели. Superseded-записи ничего
+        не удаляли и на решение не влияют."""
         if self.has_changes:
             return True
         if self.configuration_changed or not self.post_linking_impact.is_empty():
+            return True
+        if any(
+            r.graph_refresh_required and not r.superseded
+            for r in self.removed_extension_scopes
+        ):
             return True
         return any(
             sub.configuration_changed or not sub.post_linking_impact.is_empty()
@@ -266,6 +354,8 @@ class IncrementalReport:
             self.configuration_changed = True
         self.adopted_from_impact.merge(other.adopted_from_impact)
         self.post_linking_impact.merge(other.post_linking_impact)
+        self.removed_extension_scopes.extend(other.removed_extension_scopes)
+        self.pending_extension_cleanups += other.pending_extension_cleanups
         for ext_name, sub in other.extension_reports.items():
             existing = self.extension_reports.get(ext_name)
             if existing is None:
@@ -300,10 +390,18 @@ class IncrementalReport:
         return "; ".join(parts)
 
     def detailed_summary_lines(self) -> List[str]:
-        """Базовая строка + по строке на каждое изменённое расширение."""
+        """Базовая строка + по строке на каждое изменённое расширение и на
+        каждое lifecycle-событие удаления scope."""
         lines: List[str] = [self.summary_line()]
         for ext_name in sorted(self.extension_reports.keys()):
             sub = self.extension_reports[ext_name]
             if sub.has_changes:
                 lines.append(f"  ext={ext_name}: {sub.summary_line()}")
+        for removal in self.removed_extension_scopes:
+            lines.append(f"  {removal.summary()}")
+        if self.pending_extension_cleanups:
+            lines.append(
+                f"  ext_cleanup pending: {self.pending_extension_cleanups} scope(s) "
+                "will be retried next cycle"
+            )
         return lines

@@ -22,6 +22,35 @@ if TYPE_CHECKING:
     from .neo4j_init import GraphDatabaseLoader
 
 
+# Labels carrying a UNIQUE constraint on `qualified_name` (see IndexManagementMixin.create_indexes).
+# The constraint provides the index that makes an exact/prefix lookup a seek instead of a scan;
+# an unlabeled `MATCH (n)` cannot use any of them and degrades to AllNodesScan.
+# Module/Routine are absent on purpose: they are keyed by `id`, not `qualified_name`.
+_QN_LABELS: Tuple[str, ...] = (
+    "MetadataObject", "Form", "Command", "Configuration", "MetadataCategory",
+    "TabularPart", "Attribute", "Resource", "Dimension", "FormControl",
+    "FormEvent", "FormEventAction", "FormAttribute", "Layout", "Characteristic",
+    "EnumValue", "UrlTemplate", "UrlMethod", "JournalGraph", "AccountingFlag",
+    "DimensionAccountingFlag", "PredefinedItem",
+)
+
+# Each UNION part carries its own LIMIT 1: a trailing LIMIT would bind only to the last
+# part, letting the other branches enumerate every match. One row per label is all the
+# caller needs — it reads rows[0].
+_QN_EXACT_CYPHER = "\nUNION\n".join(
+    f"MATCH (n:{label} {{qualified_name: $ref}}) RETURN n.qualified_name AS qn LIMIT 1"
+    for label in _QN_LABELS
+)
+
+# `left(...)` trims a descendant QN back to the requested prefix, so a ref pointing at a
+# subtree without its own node still yields the graph's canonical casing.
+_QN_PREFIX_CYPHER = "\nUNION\n".join(
+    f"MATCH (n:{label}) WHERE n.qualified_name STARTS WITH $ref_prefix "
+    f"RETURN left(n.qualified_name, size($ref)) AS qn LIMIT 1"
+    for label in _QN_LABELS
+)
+
+
 def _canon_category_or_raw(raw: str) -> str:
     """Canonicalize a category segment (Справочник -> Справочники) via the shared
     canon_category. Returns the single canonical name when unambiguous; otherwise (unknown
@@ -235,16 +264,30 @@ def normalize_qn_ref(
             config_prefix = project_prefix + config_name + "/"
             if not ref.startswith(config_prefix):
                 raise ValueError(f"QN {ref!r} does not belong to config {config_name!r}")
-        existence_cypher = """
+        # Return the graph's own spelling, not the caller's: downstream queries compare
+        # `r.owner_qn` directly against this value, and an index seek needs an exact match.
+        # Fast paths first (index seeks), case-insensitive scan only as a fallback for
+        # mistyped casing — which is what the previous unlabeled query cost on every call.
+        rows = loader.execute_query_readonly(_QN_EXACT_CYPHER, {"ref": ref}) or []
+        if rows and rows[0].get("qn"):
+            return rows[0]["qn"]
+
+        rows = loader.execute_query_readonly(
+            _QN_PREFIX_CYPHER, {"ref": ref, "ref_prefix": ref + "/"},
+        ) or []
+        if rows and rows[0].get("qn"):
+            return rows[0]["qn"]
+
+        fallback_cypher = """
 MATCH (n)
 WHERE toLower(n.qualified_name) = toLower($ref)
    OR toLower(n.qualified_name) STARTS WITH toLower($ref) + '/'
-RETURN 1 LIMIT 1
+RETURN left(n.qualified_name, size($ref)) AS qn LIMIT 1
 """.strip()
-        rows = loader.execute_query_readonly(existence_cypher, {"ref": ref}) or []
-        if not rows:
-            raise ValueError(f"Unknown owner_ref: {ref!r} not found in graph")
-        return ref
+        rows = loader.execute_query_readonly(fallback_cypher, {"ref": ref}) or []
+        if rows and rows[0].get("qn"):
+            return rows[0]["qn"]
+        raise ValueError(f"Unknown owner_ref: {ref!r} not found in graph")
 
     # Canonicalize a leading category segment (Справочник.X -> Справочники.X) so refs with
     # singular/alias categories match the canonical category_name stored in the graph.

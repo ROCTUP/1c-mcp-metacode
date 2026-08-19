@@ -180,6 +180,56 @@ def iter_summary_dirs_on_disk() -> Iterator[Tuple[str, str, str, Path]]:
                     )
 
 
+def quarantine_configuration(config_name: str) -> Optional[Path]:
+    """Атомарно увести каталог конфигурации в `_old_<config>_<UTC-stamp>`.
+
+    Нужно при полном удалении расширения. Сами файлы не удаляются, но
+    перестают быть кандидатами для S0 bootstrap: `iter_summary_dirs_on_disk`
+    уже пропускает всё, что начинается с `_old_`. Без этого при повторном
+    появлении расширения с тем же QN S0 переподключил бы устаревшую сводку к
+    новому объекту — он ищет по `meta.object_qualified_name`, а не по времени.
+
+    Возвращает путь карантина или None, если каталога не было (идемпотентный
+    no-op). Содержимое не удаляется — retention/GC это отдельная задача.
+    """
+    base = settings.object_summary_directory
+    sanitized = _sanitize(config_name)
+    target = base / sanitized
+
+    # Containment: `_sanitize` уже вырезает разделители пути, но проверка
+    # обязательна — от неё зависит, что мы не переместим каталог вне корня.
+    try:
+        base_resolved = base.resolve()
+        target_resolved = target.resolve()
+        if target_resolved == base_resolved or base_resolved not in target_resolved.parents:
+            logger.error(
+                "quarantine_configuration: refusing to touch %s — outside %s",
+                target, base,
+            )
+            return None
+    except OSError as exc:
+        logger.warning("quarantine_configuration: cannot resolve %s: %s", target, exc)
+        return None
+
+    if not target.is_dir():
+        return None
+
+    base_stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%SZ")
+    quarantine = base / f"_old_{sanitized}_{base_stamp}"
+    suffix = 0
+    while quarantine.exists():
+        suffix += 1
+        quarantine = base / f"_old_{sanitized}_{base_stamp}-{suffix:02d}"
+
+    # os.replace, а не shutil.move: перемещение внутри одного тома должно быть
+    # атомарным, иначе прерванный cleanup оставил бы половину сводок видимой.
+    os.replace(target, quarantine)
+    logger.info(
+        "Object summaries quarantined: %s -> %s", target.name, quarantine.name
+    )
+    return quarantine
+
+
 def archive_summary_files(
     config_name: str, category: str, object_name: str
 ) -> Optional[Path]:

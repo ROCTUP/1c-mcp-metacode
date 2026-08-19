@@ -74,9 +74,11 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from config import settings
 
@@ -106,6 +108,11 @@ _MIN_SQLITE_VERSION = (3, 43, 0)
 # and rebuild. Source of truth for raw BSL is Neo4j Routine.body, so a
 # drop+rebuild is non-destructive — Phase A re-populates from Neo4j.
 _SCHEMA_VERSION = 1
+
+# Потолок, до которого WAL усекается после чекпойнта. В штатной работе он держится
+# около 4 МБ (авточекпойнт на 1000 страницах по 4 КБ), так что это страховка от
+# аномального выброса, а не рабочий режим.
+_WAL_SIZE_LIMIT_BYTES = 256 * 1024 * 1024
 
 
 # Per-unit FTS sidecars used by the structural / intent-routing legs. Module
@@ -174,6 +181,11 @@ PROJECT_SCOPED_TABLES: Tuple[str, ...] = (
     "bsl_code_phase_b_unit_state",
     "bsl_code_pending_reverse_snapshot",
     "bsl_code_pending_scoped_delta",
+    # Config-delete операция тоже project-scoped: full reload сносит очередь
+    # `extension_scope_cleanup` (её владельца), поэтому оставшиеся здесь строки
+    # стали бы вечным `CONFIG_DELETE_IN_PROGRESS` без возможности teardown.
+    "bsl_code_config_delete_ops",
+    "bsl_code_config_delete_routines",
 )
 
 
@@ -282,6 +294,27 @@ class BslCodeSqliteError(RuntimeError):
     pass
 
 
+class CommitOutcome(Enum):
+    """Исход CAS-финала scoped mutation.
+
+    Причина отказа нужна вызывающему не для лога, а для выбора владельца
+    восстановления: pending разрешится сам, устаревшая epoch означает, что
+    rebuild уже всё построил, а reindex/fingerprint требуют передать
+    восстановление полной перестройке (иначе операция за destructive-границей
+    остаётся без выхода).
+    """
+
+    COMMITTED = "committed"
+    REJECTED_PENDING = "rejected_pending"
+    REJECTED_EPOCH = "rejected_epoch"
+    REJECTED_FINGERPRINT = "rejected_fingerprint"
+    REJECTED_REINDEX = "rejected_reindex"
+
+    @property
+    def ok(self) -> bool:
+        return self is CommitOutcome.COMMITTED
+
+
 class BslCodeSqlite:
     def __init__(self, db_path: Optional[str] = None) -> None:
         self._lock = threading.RLock()
@@ -300,6 +333,7 @@ class BslCodeSqlite:
 
         self._init_pragmas()
         self._init_schema()
+        self._ensure_additive_tables()
 
     # ------------------------------------------------------------------ init
 
@@ -325,6 +359,20 @@ class BslCodeSqlite:
             cur.execute("PRAGMA journal_mode=WAL")
             cur.execute("PRAGMA busy_timeout=5000")
             cur.execute("PRAGMA foreign_keys=ON")
+            # Умолчание SQLite — 2 МБ страничного кэша, что на базе в сотни
+            # мегабайт даёт постоянный промах на записи в FTS-индексы.
+            cache_kib = max(1, int(settings.bsl_code_sqlite_cache_mb)) * 1024
+            cur.execute(f"PRAGMA cache_size=-{cache_kib}")
+            # После чекпойнта WAL усекается до этого размера. Без лимита файл
+            # навсегда остаётся на пиковом размере, даже когда чекпойнты проходят
+            # штатно: SQLite переиспользует его, а не обрезает.
+            cur.execute(f"PRAGMA journal_size_limit={_WAL_SIZE_LIMIT_BYTES}")
+            # `synchronous` намеренно оставлен в умолчании (FULL). Соединение одно
+            # на весь класс, поэтому послабление применилось бы и к записям, которые
+            # служат durable-барьером перед мутациями Neo4j: снапшот обратных
+            # счётчиков и ledger перед перезаписью тел, gate и scoped_retry_pending
+            # перед сменой visibility. Потеря хвоста коммитов при отказе питания
+            # оставила бы наполовину применённую операцию без возможности доиграть.
 
     def _user_version(self) -> int:
         with self._lock:
@@ -359,6 +407,74 @@ class BslCodeSqlite:
             self._apply_schema()
             self._set_user_version(_SCHEMA_VERSION)
 
+    def _ensure_additive_tables(self) -> None:
+        """Additive-миграция: догнать таблицы, добавленные ПОСЛЕ выпуска схемы.
+
+        Отдельный шаг, а не строки в `_apply_schema`, потому что для уже
+        существующего sidecar ни одна DDL оттуда не выполнится: `_init_schema`
+        выходит при `user_version == _SCHEMA_VERSION`, а `_apply_schema`
+        дополнительно выходит, если `bsl_code_units` уже есть.
+
+        Повышение `_SCHEMA_VERSION` здесь недопустимо: ветка version bump
+        вызывает `_drop_legacy_bsl_tables()` и перестраивает индекс с нуля,
+        то есть запускает ровно тот полный Phase A, который config-delete и
+        призван устранить. Приём тот же, что у
+        `IncrementalLoadingState._migrate_metadata_object_hashes`.
+
+        Идемпотентен: только `IF NOT EXISTS`, выполняется при каждом открытии.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bsl_code_config_delete_ops (
+                        project_name   TEXT NOT NULL,
+                        operation_id   TEXT NOT NULL,
+                        config_name    TEXT NOT NULL,
+                        index_epoch    INTEGER NOT NULL,
+                        -- nullable и НЕ участвует ни в одном решении: при
+                        -- ENABLE_BSL_CODE_EMBEDDING=false (значение по
+                        -- умолчанию) vector_epoch штатно NULL. Только диагностика.
+                        vector_epoch   INTEGER,
+                        fingerprint    TEXT NOT NULL DEFAULT '',
+                        rel_paths_json TEXT NOT NULL DEFAULT '[]',
+                        serving_count  INTEGER NOT NULL DEFAULT 0,
+                        graph_count    INTEGER NOT NULL DEFAULT 0,
+                        state          TEXT NOT NULL,
+                        fallback_reason TEXT NOT NULL DEFAULT '',
+                        created_at     INTEGER NOT NULL,
+                        updated_at     INTEGER NOT NULL,
+                        PRIMARY KEY (project_name, operation_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS bsl_code_config_delete_routines (
+                        project_name TEXT NOT NULL,
+                        operation_id TEXT NOT NULL,
+                        routine_id   TEXT NOT NULL,
+                        rel_path     TEXT NOT NULL DEFAULT '',
+                        in_serving   INTEGER NOT NULL DEFAULT 1,
+                        idf_json     TEXT NOT NULL DEFAULT '{}',
+                        stats_json   TEXT NOT NULL DEFAULT '{}',
+                        stage        TEXT NOT NULL,
+                        PRIMARY KEY (project_name, operation_id, routine_id)
+                    )
+                    """
+                )
+                cur.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_cfg_delete_routines_stage "
+                    "ON bsl_code_config_delete_routines("
+                    "project_name, operation_id, stage)"
+                )
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
     def _drop_legacy_bsl_tables(self) -> None:
         # Drop everything the BSL code search subsystem owns. Used only when
         # a future schema bump is detected; on a fresh DB this is unreachable.
@@ -378,6 +494,8 @@ class BslCodeSqlite:
             "bsl_code_search_fingerprints",
             "bsl_code_pending_reverse_snapshot",
             "bsl_code_pending_scoped_delta",
+            "bsl_code_config_delete_ops",
+            "bsl_code_config_delete_routines",
             "bsl_code_module_fragments",
             *STRUCTURAL_FTS_TABLES,
         )
@@ -2642,6 +2760,18 @@ class BslCodeSqlite:
         Stream distinct module rows from bsl_code_units for `epoch` so
         Phase A finalize can repopulate bsl_code_modules without going back
         to Neo4j. Generator: only the current chunk is buffered.
+
+        The two-step shape is deliberate. The consumer writes bsl_code_modules
+        from inside the consumption loop, and any active statement holds a read
+        transaction that blocks WAL checkpointing entirely — `PRAGMA
+        wal_checkpoint` fails with `database table is locked`. So the source
+        DISTINCT is materialized into a TEMP table in a single pass, and that
+        table is then read in `rowid` pages, each page fetched in full before it
+        is yielded: no cursor stays open across a `yield`.
+
+        The TEMP table name is unique per call. The connection is process-wide
+        and the lock is released between pages, so a fixed name would be shared
+        state: two live generators would drop and recreate each other's table.
         """
         sql = """
             SELECT DISTINCT owner_qn, config_name, module_type,
@@ -2649,14 +2779,25 @@ class BslCodeSqlite:
             FROM bsl_code_units
             WHERE project_name = ? AND index_epoch = ? AND owner_qn != ''
         """
+        table = "module_rebuild_" + uuid.uuid4().hex
         with self._lock:
-            cur = self._conn.execute(sql, (scope, int(epoch)))
+            self._conn.execute(
+                f'CREATE TEMP TABLE "{table}" AS {sql}', (scope, int(epoch)),
+            )
         try:
+            last_rowid = 0
             while True:
                 with self._lock:
-                    rows = cur.fetchmany(self._PHASE_A_FINALIZE_CHUNK)
+                    rows = self._conn.execute(
+                        f'SELECT rowid, owner_qn, config_name, module_type, '
+                        f'       module_kind, owner_category, rel_path '
+                        f'FROM temp."{table}" '
+                        f'WHERE rowid > ? ORDER BY rowid LIMIT ?',
+                        (last_rowid, self._PHASE_A_FINALIZE_CHUNK),
+                    ).fetchall()
                 if not rows:
                     return
+                last_rowid = int(rows[-1]["rowid"])
                 for r in rows:
                     yield {
                         "module_id": r["owner_qn"],
@@ -2669,7 +2810,7 @@ class BslCodeSqlite:
                     }
         finally:
             with self._lock:
-                cur.close()
+                self._conn.execute(f'DROP TABLE IF EXISTS temp."{table}"')
 
     # ---- Phase B unit state ----
 
@@ -3450,6 +3591,27 @@ class BslCodeSqlite:
                 cur.execute("ROLLBACK")
                 raise
 
+    def _request_reindex_in_tx(self, cur: sqlite3.Cursor, scope: str) -> None:
+        """In-tx близнец `request_reindex` (пара как у
+        `_delete_phase_a_routine_in_tx` / `delete_phase_a_routine_rows`).
+
+        Нужен, чтобы удаление строк конфигурации и обязательство перестроить
+        индекс попадали в ОДНУ транзакцию. Раздельные вызовы оставляли бы
+        crash-окно: падение между ними приводит к тому, что повтор видит уже
+        очищенные таблицы, получает `deleted == 0` и по правилу «reindex только
+        при deleted > 0» флаг не ставит — corpus IDF/stats остаются от старого
+        поколения без сигнала на восстановление.
+        """
+        cur.execute(
+            "INSERT OR IGNORE INTO bsl_code_search_fingerprints(project_name) VALUES (?)",
+            (scope,),
+        )
+        cur.execute(
+            "UPDATE bsl_code_search_fingerprints "
+            "SET reindex_requested = 1 WHERE project_name = ?",
+            (scope,),
+        )
+
     def request_reindex(self, scope: str) -> None:
         with self._lock:
             self._ensure_fingerprint_row(scope)
@@ -3459,6 +3621,86 @@ class BslCodeSqlite:
                 (scope,),
             )
 
+    def request_reindex_if_pending_active(self, scope: str) -> bool:
+        """Поставить `reindex_requested = 1`, но только если pending epoch активна.
+
+        Это тот самый сигнал от cleanup-очереди к владельцу прогресса. Без него
+        escape в `BslCodeSearchSync` недостижим в каноническом сценарии удаления:
+        в установившемся состоянии `reindex_requested = 0`, graph stage флага не
+        трогает, а атомарный purge до флага не доходит, потому что операция
+        выходит раньше на `PENDING_REBUILD`. Отметка `pending_updated_at` стареет,
+        но escape так и не срабатывает, и очередь стоит вечно.
+
+        Перепроверка активности ВНУТРИ транзакции обязательна: без неё гонка
+        «pending завершилась между чтением readiness и записью флага» приводила
+        бы к лишней полной перестройке здорового индекса.
+
+        Возвращает True, если флаг был выставлен.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                row = cur.execute(
+                    "SELECT pending_epoch, pending_status "
+                    "FROM bsl_code_search_fingerprints WHERE project_name = ?",
+                    (scope,),
+                ).fetchone()
+                if row is None:
+                    cur.execute("COMMIT")
+                    return False
+                pending_epoch = row["pending_epoch"] if "pending_epoch" in row.keys() else row[0]
+                pending_status = (
+                    row["pending_status"] if "pending_status" in row.keys() else row[1]
+                ) or ""
+                if pending_epoch is None or pending_status not in ("writing", "finalizing"):
+                    cur.execute("COMMIT")
+                    return False
+                self._request_reindex_in_tx(cur, scope)
+                cur.execute("COMMIT")
+                return True
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
+    def pending_is_stale(self, scope: str, stale_after_seconds: int) -> bool:
+        """Устарела ли отметка живости pending epoch.
+
+        `pending_updated_at` обновляется на каждом flush прогресса Phase A,
+        поэтому живой rebuild держит её свежей, а аварийно завершившийся —
+        оставляет стареть. Это позволяет отличить мёртвый поток от живого по
+        данным, без доступа к самому потоку.
+
+        При отсутствии `pending_updated_at` берётся `pending_started_at`; если
+        нет и его — считаем НЕ устаревшим (fail closed: не трогать эпоху,
+        про которую ничего не известно).
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT pending_epoch, pending_status, pending_started_at, pending_updated_at "
+                "FROM bsl_code_search_fingerprints WHERE project_name = ?",
+                (scope,),
+            ).fetchone()
+        if row is None:
+            return False
+        keys = row.keys() if hasattr(row, "keys") else []
+
+        def _get(name: str, idx: int):
+            return row[name] if name in keys else row[idx]
+
+        if _get("pending_epoch", 0) is None:
+            return False
+        if (_get("pending_status", 1) or "") not in ("writing", "finalizing"):
+            return False
+        stamp = _get("pending_updated_at", 3) or _get("pending_started_at", 2)
+        if not stamp:
+            return False
+        try:
+            marker = time.mktime(time.strptime(str(stamp), "%Y-%m-%dT%H:%M:%SZ")) - time.timezone
+        except (ValueError, OverflowError):
+            return False
+        return (time.time() - marker) > max(1, int(stale_after_seconds))
+
     def commit_scoped_delta(
         self,
         scope: str,
@@ -3467,7 +3709,11 @@ class BslCodeSqlite:
         *,
         clear_ledger_routine_ids: Optional[Iterable[str]] = None,
         clear_pending_rel_paths: Optional[Iterable[str]] = None,
-    ) -> bool:
+        expected_epoch: Optional[int] = None,
+        expected_fingerprint: Optional[str] = None,
+        expect_reindex_cleared: bool = False,
+        config_delete_operation_id: Optional[str] = None,
+    ) -> "CommitOutcome":
         """Атомарный финал успешного scoped delta apply.
 
         Делает в одной tx:
@@ -3477,12 +3723,22 @@ class BslCodeSqlite:
           pending_rel_paths_json);
         - удаляет ledger rows для `clear_ledger_routine_ids`;
         - удаляет snapshot rows для `clear_ledger_routine_ids` (на случай если
-          они остались — повторная очистка идемпотентна).
+          они остались — повторная очистка идемпотентна);
+        - при `config_delete_operation_id` переводит header операции в
+          `committed` ТУТ ЖЕ. Отдельный вызов рядом создавал бы окно, в котором
+          любой из двух порядков даёт неверное восстановление после рестарта:
+          пометить раньше — принять невычтенные counters за согласованные;
+          позже — отправить уже согласованный индекс в legacy purge с полной
+          перестройкой.
 
-        Conditional UPDATE WHERE `pending_epoch IS NULL` гарантирует, что мы не
-        перезаписываем fingerprint row, у которой active `pending_epoch`
-        (background `start_indexing()` уже строит full rebuild). Возвращает True,
-        если row была обновлена; False — если pending state случился в race-окне.
+        CAS-условия (все необязательные, без них поведение прежнее):
+        `expected_epoch`, `expected_fingerprint`, `expect_reindex_cleared`.
+        Последнее важно само по себе: безусловная запись `reindex_requested = 0`
+        молча стирала бы чужое обязательство на полную перестройку, возникшее во
+        время apply.
+
+        Возвращает `CommitOutcome` — причина отказа вычисляется ВНУТРИ той же
+        транзакции, иначе классификация liveness сама была бы гонкой.
         """
         ledger_ids = list(clear_ledger_routine_ids or [])
         with self._lock:
@@ -3490,7 +3746,7 @@ class BslCodeSqlite:
             cur = self._conn.cursor()
             cur.execute("BEGIN")
             try:
-                upd = cur.execute(
+                sql = (
                     "UPDATE bsl_code_search_fingerprints "
                     "SET source_state_hash = ?, fingerprint = ?, "
                     "    reindex_requested = 0, "
@@ -3499,12 +3755,34 @@ class BslCodeSqlite:
                     "    visibility_flip_done = 0, "
                     "    pending_routine_ids_json = '[]', "
                     "    pending_rel_paths_json = '[]' "
-                    "WHERE project_name = ? AND pending_epoch IS NULL",
-                    (source_state_hash, fingerprint, scope),
+                    "WHERE project_name = ? AND pending_epoch IS NULL"
                 )
+                params: List[Any] = [source_state_hash, fingerprint, scope]
+                if expected_epoch is not None:
+                    sql += " AND current_epoch = ?"
+                    params.append(int(expected_epoch))
+                if expected_fingerprint is not None:
+                    sql += " AND fingerprint = ?"
+                    params.append(expected_fingerprint)
+                if expect_reindex_cleared:
+                    sql += " AND reindex_requested = 0"
+                upd = cur.execute(sql, tuple(params))
                 if (upd.rowcount or 0) == 0:
+                    outcome = self._classify_commit_rejection_in_tx(
+                        cur, scope,
+                        expected_epoch=expected_epoch,
+                        expected_fingerprint=expected_fingerprint,
+                        expect_reindex_cleared=expect_reindex_cleared,
+                    )
                     cur.execute("ROLLBACK")
-                    return False
+                    return outcome
+                if config_delete_operation_id:
+                    cur.execute(
+                        "UPDATE bsl_code_config_delete_ops "
+                        "SET state = 'committed', updated_at = ? "
+                        "WHERE project_name = ? AND operation_id = ?",
+                        (int(time.time()), scope, config_delete_operation_id),
+                    )
                 if ledger_ids:
                     for start in range(0, len(ledger_ids), 500):
                         chunk = ledger_ids[start: start + 500]
@@ -3520,10 +3798,42 @@ class BslCodeSqlite:
                             (scope, *chunk),
                         )
                 cur.execute("COMMIT")
-                return True
+                return CommitOutcome.COMMITTED
             except Exception:
                 cur.execute("ROLLBACK")
                 raise
+
+    def _classify_commit_rejection_in_tx(
+        self,
+        cur: sqlite3.Cursor,
+        scope: str,
+        *,
+        expected_epoch: Optional[int],
+        expected_fingerprint: Optional[str],
+        expect_reindex_cleared: bool,
+    ) -> "CommitOutcome":
+        """Почему CAS не прошёл. Читается в той же транзакции, что и UPDATE.
+
+        Порядок проверок = порядку владения восстановлением: активная pending
+        epoch важнее устаревшей epoch, та важнее fingerprint, и только потом
+        reindex-флаг.
+        """
+        row = cur.execute(
+            "SELECT current_epoch, pending_epoch, fingerprint, reindex_requested "
+            "FROM bsl_code_search_fingerprints WHERE project_name = ?",
+            (scope,),
+        ).fetchone()
+        if row is None:
+            return CommitOutcome.REJECTED_EPOCH
+        if row["pending_epoch"] is not None:
+            return CommitOutcome.REJECTED_PENDING
+        if expected_epoch is not None and int(row["current_epoch"] or 0) != int(expected_epoch):
+            return CommitOutcome.REJECTED_EPOCH
+        if expected_fingerprint is not None and (row["fingerprint"] or "") != expected_fingerprint:
+            return CommitOutcome.REJECTED_FINGERPRINT
+        if expect_reindex_cleared and int(row["reindex_requested"] or 0):
+            return CommitOutcome.REJECTED_REINDEX
+        return CommitOutcome.REJECTED_PENDING
 
     def classify_delta_readiness(self, scope: str):
         """Семантическая классификация fingerprint state для phase 5.
@@ -3532,8 +3842,21 @@ class BslCodeSqlite:
           READY            — scoped delta можно применить.
           PENDING_REBUILD  — background full rebuild активен; scoped delta skip.
           REINDEX_REQUIRED — fingerprint mismatch; controlled full rebuild через start_indexing.
+          CONFIG_DELETE_IN_PROGRESS — идёт удаление конфигурации; чужие
+                              потребители обязаны отступить, не трогая ни gate,
+                              ни counters.
           SCOPED_RETRY     — unfinished scoped apply (любой из gating флагов /
                               ledger rows / scoped_apply_in_progress=1); replay scoped.
+
+        Приоритет `REINDEX_REQUIRED` ВЫШЕ `CONFIG_DELETE_IN_PROGRESS` не
+        косметика: config delete не имеет права запирать восстановление
+        индекса, иначе операция, уже пересёкшая destructive-границу, остаётся
+        без выхода. Операция в `fallback_rebuild_required` этого состояния не
+        даёт вовсе — она сама передала владение rebuild'у.
+
+        Это сигнал для ЧУЖИХ потребителей. Владелец операции (координатор,
+        знающий её `operation_id`) обязан отличать собственное постусловие от
+        конфликта, иначе не сможет усыновить свою же подготовку после сбоя.
         """
         from .bsl_code_search_delta import DeltaReadiness  # local import: avoid cycle
         with self._lock:
@@ -3548,7 +3871,15 @@ class BslCodeSqlite:
                 "WHERE project_name = ? LIMIT 1",
                 (scope,),
             ).fetchone()
+            config_delete_row = self._conn.execute(
+                "SELECT 1 FROM bsl_code_config_delete_ops "
+                "WHERE project_name = ? AND state IN ('prepared', 'committed') "
+                "LIMIT 1",
+                (scope,),
+            ).fetchone()
         if row is None:
+            if config_delete_row is not None:
+                return DeltaReadiness.CONFIG_DELETE_IN_PROGRESS
             return (DeltaReadiness.SCOPED_RETRY if ledger_row is not None
                     else DeltaReadiness.READY)
         keys = row.keys() if hasattr(row, "keys") else []
@@ -3563,6 +3894,8 @@ class BslCodeSqlite:
             return DeltaReadiness.PENDING_REBUILD
         if reindex_requested:
             return DeltaReadiness.REINDEX_REQUIRED
+        if config_delete_row is not None:
+            return DeltaReadiness.CONFIG_DELETE_IN_PROGRESS
         if scoped_retry_pending or scoped_apply_in_progress or ledger_row is not None:
             return DeltaReadiness.SCOPED_RETRY
         return DeltaReadiness.READY
@@ -3616,36 +3949,75 @@ class BslCodeSqlite:
           - scoped_apply_in_progress = 0, pending_*_json = '[]', visibility_flip_done = 0
             (scoped_retry_pending не трогаем — он управляется отдельным API / commit).
         """
-        ids_json = json.dumps(sorted(routine_ids or []), ensure_ascii=False)
-        rel_paths_json = json.dumps(sorted(rel_paths or []), ensure_ascii=False)
         with self._lock:
             self._ensure_fingerprint_row(scope)
-            if in_progress:
-                sets = [
-                    "scoped_apply_in_progress = 1",
-                    "pending_routine_ids_json = ?",
-                    "pending_rel_paths_json = ?",
-                    "visibility_flip_done = ?",
-                ]
-                params: List[Any] = [ids_json, rel_paths_json, 1 if visibility_flip_done else 0]
-                if also_set_scoped_retry_pending:
-                    sets.append("scoped_retry_pending = 1")
-                params.append(scope)
-                self._conn.execute(
-                    f"UPDATE bsl_code_search_fingerprints SET {', '.join(sets)} "
-                    f"WHERE project_name = ?",
-                    tuple(params),
-                )
-            else:
-                self._conn.execute(
-                    "UPDATE bsl_code_search_fingerprints "
-                    "SET scoped_apply_in_progress = 0, "
-                    "    pending_routine_ids_json = '[]', "
-                    "    pending_rel_paths_json = '[]', "
-                    "    visibility_flip_done = 0 "
-                    "WHERE project_name = ?",
-                    (scope,),
-                )
+            self._set_scoped_gate_in_tx(
+                self._conn, scope, in_progress,
+                routine_ids=routine_ids, rel_paths=rel_paths,
+                also_set_scoped_retry_pending=also_set_scoped_retry_pending,
+                visibility_flip_done=visibility_flip_done,
+                ensure_row=False,
+            )
+
+    def _set_scoped_gate_in_tx(
+        self,
+        cur: Any,
+        scope: str,
+        in_progress: bool,
+        *,
+        routine_ids: Optional[Iterable[str]] = None,
+        rel_paths: Optional[Iterable[str]] = None,
+        also_set_scoped_retry_pending: bool = False,
+        visibility_flip_done: bool = False,
+        ensure_row: bool = True,
+    ) -> None:
+        """In-tx близнец `set_scoped_apply_in_progress_atomic`.
+
+        Нужен, чтобы поднятие/снятие gate попадало в ОДНУ транзакцию с записью
+        или удалением config-delete операции: раздельные вызовы оставляли бы
+        окно, где снимок уже есть, а поиск ещё показывает расширение (или
+        наоборот — операции нет, а gate висит).
+
+        `visibility_flip_done=True` у config delete осмысленно: консервативный
+        режим векторной ноги не нужен, потому что удаляемые routines и так
+        вычитаются из кандидатов обеих ног.
+        """
+        ids_json = json.dumps(sorted(routine_ids or []), ensure_ascii=False)
+        rel_paths_json = json.dumps(sorted(rel_paths or []), ensure_ascii=False)
+        if ensure_row:
+            cur.execute(
+                "INSERT OR IGNORE INTO bsl_code_search_fingerprints(project_name) "
+                "VALUES (?)",
+                (scope,),
+            )
+        if in_progress:
+            sets = [
+                "scoped_apply_in_progress = 1",
+                "pending_routine_ids_json = ?",
+                "pending_rel_paths_json = ?",
+                "visibility_flip_done = ?",
+            ]
+            params: List[Any] = [
+                ids_json, rel_paths_json, 1 if visibility_flip_done else 0,
+            ]
+            if also_set_scoped_retry_pending:
+                sets.append("scoped_retry_pending = 1")
+            params.append(scope)
+            cur.execute(
+                f"UPDATE bsl_code_search_fingerprints SET {', '.join(sets)} "
+                f"WHERE project_name = ?",
+                tuple(params),
+            )
+        else:
+            cur.execute(
+                "UPDATE bsl_code_search_fingerprints "
+                "SET scoped_apply_in_progress = 0, "
+                "    pending_routine_ids_json = '[]', "
+                "    pending_rel_paths_json = '[]', "
+                "    visibility_flip_done = 0 "
+                "WHERE project_name = ?",
+                (scope,),
+            )
 
     def mark_visibility_flip_done(self, scope: str, value: bool) -> None:
         with self._lock:
@@ -3969,6 +4341,67 @@ class BslCodeSqlite:
         if stats_increments:
             self._upsert_corpus_stats_in_tx(cur, scope, int(epoch), stats_increments)
 
+    def _settle_reverse_counters_in_tx(
+        self,
+        cur: sqlite3.Cursor,
+        scope: str,
+        epoch: int,
+        idf_reverse: Optional[Dict[str, Dict[str, int]]],
+        stats_reverse: Optional[Dict[str, Tuple[int, int]]],
+    ) -> None:
+        """Постобработка обратного вычитания в ТОЙ ЖЕ транзакции.
+
+        1. Отрицательное значение — признак недоказанного дрейфа: вычли
+           больше, чем было добавлено. Тихо продолжать нельзя, поэтому
+           `RuntimeError` → ROLLBACK. Исход детерминированный (тот же снимок
+           даст тот же underflow), поэтому вызывающий обязан перевести
+           операцию в fallback, а не бесконечно ретраить.
+        2. Строки `df = 0` удаляются: у токена, который жил только в удаляемой
+           конфигурации, эталонный полный rebuild строки не создаёт вовсе.
+           Без этого состояние отличалось бы от эталона (поведенчески такие
+           строки инертны, но побайтового совпадения нет) и копило мусор.
+
+        Проверяются только затронутые `(field_kind, token)` — стоимость
+        пропорциональна удаляемому, а не корпусу.
+        """
+        if idf_reverse:
+            for fk, token_to_df in idf_reverse.items():
+                tokens = [t for t, d in token_to_df.items() if t and d]
+                for start in range(0, len(tokens), 500):
+                    chunk = tokens[start: start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    row = cur.execute(
+                        f"SELECT token, df FROM bsl_code_corpus_idf "
+                        f"WHERE project_name = ? AND index_epoch = ? "
+                        f"  AND field_kind = ? AND df < 0 "
+                        f"  AND token IN ({placeholders}) LIMIT 1",
+                        (scope, int(epoch), fk, *chunk),
+                    ).fetchone()
+                    if row is not None:
+                        raise BslCodeSqliteError(
+                            f"corpus_idf underflow: field_kind={fk!r} "
+                            f"token={row[0]!r} df={row[1]}"
+                        )
+                    cur.execute(
+                        f"DELETE FROM bsl_code_corpus_idf "
+                        f"WHERE project_name = ? AND index_epoch = ? "
+                        f"  AND field_kind = ? AND df = 0 "
+                        f"  AND token IN ({placeholders})",
+                        (scope, int(epoch), fk, *chunk),
+                    )
+        if stats_reverse:
+            for fk in stats_reverse:
+                row = cur.execute(
+                    "SELECT doc_count, total_length FROM bsl_code_corpus_stats "
+                    "WHERE project_name = ? AND index_epoch = ? AND field_kind = ?",
+                    (scope, int(epoch), fk),
+                ).fetchone()
+                if row is not None and (int(row[0]) < 0 or int(row[1]) < 0):
+                    raise BslCodeSqliteError(
+                        f"corpus_stats underflow: field_kind={fk!r} "
+                        f"doc_count={row[0]} total_length={row[1]}"
+                    )
+
     def _clear_snapshot_in_tx(
         self,
         cur: sqlite3.Cursor,
@@ -4107,10 +4540,17 @@ class BslCodeSqlite:
         stats_reverse: Optional[Dict[str, Tuple[int, int]]] = None,
         clear_snapshot_ids: Optional[Iterable[str]] = None,
         set_ledger_stage: Optional[str] = "sqlite_applied",
+        config_delete_operation_id: Optional[str] = None,
     ) -> int:
         """Atomic scoped delete: reverse counters + per-routine delete +
         snapshot clear + ledger stage transition. Returns count of routines
-        actually processed."""
+        actually processed.
+
+        `config_delete_operation_id` переключает durable-владельца: вместо
+        общего ledger/snapshot в той же транзакции продвигаются строки
+        config-delete операции. Тот же примитив, тот же инвариант «вычитание
+        counters и удаление строк — одна транзакция», разные хранилища
+        прогресса."""
         ids = list(routine_ids or ())
         if not ids:
             return 0
@@ -4119,13 +4559,708 @@ class BslCodeSqlite:
             cur.execute("BEGIN")
             try:
                 self._upsert_idf_stats_in_tx(cur, scope, int(epoch), idf_reverse, stats_reverse)
+                self._settle_reverse_counters_in_tx(
+                    cur, scope, int(epoch), idf_reverse, stats_reverse,
+                )
                 for rid in ids:
                     self._delete_phase_a_routine_in_tx(cur, scope, int(epoch), rid)
-                self._clear_snapshot_in_tx(cur, scope, clear_snapshot_ids or ids)
-                if set_ledger_stage:
-                    self._set_ledger_stage_in_tx(cur, scope, ids, set_ledger_stage)
+                if config_delete_operation_id:
+                    self._set_config_delete_stage_in_tx(
+                        cur, scope, config_delete_operation_id, ids, "sqlite_applied",
+                    )
+                else:
+                    self._clear_snapshot_in_tx(cur, scope, clear_snapshot_ids or ids)
+                    if set_ledger_stage:
+                        self._set_ledger_stage_in_tx(cur, scope, ids, set_ledger_stage)
                 cur.execute("COMMIT")
                 return len(ids)
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
+    def _set_config_delete_stage_in_tx(
+        self,
+        cur: sqlite3.Cursor,
+        scope: str,
+        operation_id: str,
+        routine_ids: Iterable[str],
+        stage: str,
+    ) -> None:
+        ids = list(routine_ids or ())
+        if not ids:
+            return
+        for start in range(0, len(ids), 500):
+            chunk = ids[start: start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            cur.execute(
+                f"UPDATE bsl_code_config_delete_routines SET stage = ? "
+                f"WHERE project_name = ? AND operation_id = ? "
+                f"  AND routine_id IN ({placeholders})",
+                (stage, scope, operation_id, *chunk),
+            )
+
+    # ------------------------------------------------------------------
+    # config-scoped purge (удаление расширения)
+    # ------------------------------------------------------------------
+
+    def _delete_config_modules_and_fts_in_tx(
+        self, cur: sqlite3.Cursor, scope: str, epoch: int, config_name: str,
+    ) -> int:
+        """Снести модули конфигурации и их module FTS. Возвращает число модулей.
+
+        `rel_path` сравнивается с чужими конфигурациями: у расширения и базы
+        пути не пересекаются, но полагаться на это при физическом удалении
+        нельзя — FTS базы снесло бы вместе с расширением.
+
+        Общий для legacy purge и residual-стадии scoped-удаления. Второй
+        обязан вызывать именно это: scoped apply пересобирает module FTS по
+        затронутым путям и вставляет ПУСТУЮ строку для пути, у которого не
+        осталось ни одного фрагмента, — её убирает этот же helper.
+        """
+        own_rel_paths = {
+            r[0] for r in cur.execute(
+                "SELECT DISTINCT rel_path FROM bsl_code_modules "
+                "WHERE project_name = ? AND config_name = ? AND index_epoch = ?",
+                (scope, config_name, int(epoch)),
+            ).fetchall() if r[0]
+        }
+        foreign_rel_paths = {
+            r[0] for r in cur.execute(
+                "SELECT DISTINCT rel_path FROM bsl_code_modules "
+                "WHERE project_name = ? AND config_name != ? AND index_epoch = ?",
+                (scope, config_name, int(epoch)),
+            ).fetchall() if r[0]
+        }
+        for rel_path in sorted(own_rel_paths - foreign_rel_paths):
+            cur.execute(
+                f"DELETE FROM {MODULE_FTS_TABLE} "
+                "WHERE rowid IN ("
+                "  SELECT module_rowid FROM bsl_code_module_fts_rows "
+                "  WHERE project_name = ? AND index_epoch = ? AND rel_path = ?"
+                ")",
+                (scope, int(epoch), rel_path),
+            )
+            cur.execute(
+                "DELETE FROM bsl_code_module_fts_rows "
+                "WHERE project_name = ? AND index_epoch = ? AND rel_path = ?",
+                (scope, int(epoch), rel_path),
+            )
+        cur.execute(
+            "DELETE FROM bsl_code_modules "
+            "WHERE project_name = ? AND config_name = ? AND index_epoch = ?",
+            (scope, config_name, int(epoch)),
+        )
+        return max(0, cur.rowcount or 0)
+
+    def routine_ids_for_config(
+        self, scope: str, epoch: int, config_name: str
+    ) -> List[str]:
+        """Routine IDs указанной конфигурации в указанной эпохе.
+
+        Опирается на существующий индекс (project_name, config_name, index_epoch).
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT routine_id FROM bsl_code_units "
+                "WHERE project_name = ? AND config_name = ? AND index_epoch = ?",
+                (scope, config_name, int(epoch)),
+            ).fetchall()
+        return [r[0] for r in rows]
+
+    def purge_config_and_request_reindex(
+        self, scope: str, epoch: int, config_name: str
+    ) -> Dict[str, int]:
+        """Снести из serving epoch все строки конфигурации и, если что-то
+        реально удалено, в ТОЙ ЖЕ транзакции запросить полную перестройку.
+
+        Атомарность обязательна: corpus IDF/stats намеренно не откатываются
+        (их пересчитает rebuild), поэтому обязательство перестроить индекс —
+        единственный сигнал восстановления. Разрыв purge и `request_reindex`
+        на две транзакции создавал бы окно, после падения в котором повтор
+        получил бы `deleted == 0`, флаг бы не поставил и продвинул стадию с
+        устаревшими статистиками.
+
+        `reindex_requested` НЕ выставляется при нулевом удалении: идемпотентный
+        повтор не должен провоцировать бесполезную полную перестройку.
+
+        Возвращает счётчики удалённых строк по группам.
+        """
+        epoch = int(epoch)
+        deleted: Dict[str, int] = {}
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                routine_ids = [
+                    r[0] for r in cur.execute(
+                        "SELECT DISTINCT routine_id FROM bsl_code_units "
+                        "WHERE project_name = ? AND config_name = ? AND index_epoch = ?",
+                        (scope, config_name, epoch),
+                    ).fetchall()
+                ]
+                unit_ids = [
+                    r[0] for r in cur.execute(
+                        "SELECT unit_id FROM bsl_code_units "
+                        "WHERE project_name = ? AND config_name = ? AND index_epoch = ?",
+                        (scope, config_name, epoch),
+                    ).fetchall()
+                ]
+
+                # 1. Per-routine удаление: units + contentless units_fts по rowid +
+                # unit_fields + structural FTS + methods + module_fragments.
+                for rid in routine_ids:
+                    self._delete_phase_a_routine_in_tx(cur, scope, epoch, rid)
+                deleted["routines"] = len(routine_ids)
+                deleted["units"] = len(unit_ids)
+
+                # 2. Phase B markers удалённых юнитов — по всем vector-эпохам:
+                # сами юниты исчезли, маркер про них смысла не имеет.
+                for start in range(0, len(unit_ids), 500):
+                    chunk = unit_ids[start: start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    cur.execute(
+                        f"DELETE FROM bsl_code_phase_b_unit_state "
+                        f"WHERE project_name = ? AND unit_id IN ({placeholders})",
+                        (scope, *chunk),
+                    )
+
+                # 3. Phase A progress rows.
+                for start in range(0, len(routine_ids), 500):
+                    chunk = routine_ids[start: start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    cur.execute(
+                        f"DELETE FROM bsl_code_phase_a_routine_state "
+                        f"WHERE project_name = ? AND index_epoch = ? "
+                        f"  AND routine_id IN ({placeholders})",
+                        (scope, epoch, *chunk),
+                    )
+
+                # 4. Модули конфигурации и их module FTS.
+                deleted["modules"] = self._delete_config_modules_and_fts_in_tx(
+                    cur, scope, epoch, config_name,
+                )
+
+                # Defensive: methods могут остаться, если routine_id пропал из
+                # units, но строка метода уцелела от старой эпохи записи.
+                cur.execute(
+                    "DELETE FROM bsl_code_methods "
+                    "WHERE project_name = ? AND config_name = ? AND index_epoch = ?",
+                    (scope, config_name, epoch),
+                )
+                deleted["methods_residual"] = max(0, cur.rowcount or 0)
+
+                # 5. Verification в той же транзакции: остаток → rollback.
+                for table in ("bsl_code_units", "bsl_code_methods", "bsl_code_modules"):
+                    left = cur.execute(
+                        f"SELECT count(*) FROM {table} "
+                        "WHERE project_name = ? AND config_name = ? AND index_epoch = ?",
+                        (scope, config_name, epoch),
+                    ).fetchone()[0]
+                    if left:
+                        raise RuntimeError(
+                            f"purge_config: {left} row(s) of config {config_name!r} "
+                            f"remain in {table} after purge"
+                        )
+
+                total = sum(deleted.values())
+                if total > 0:
+                    self._request_reindex_in_tx(cur, scope)
+                    deleted["reindex_requested"] = 1
+                cur.execute("COMMIT")
+                return deleted
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
+    # ------------------------------------------------------------------
+    # config delete: durable-подготовка обратного вычитания
+    # ------------------------------------------------------------------
+
+    def list_config_serving_routines(
+        self, scope: str, epoch: int, config_name: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Serving-множество конфигурации вместе с authoritative-разбиением.
+
+        Возвращает {routine_id: {..., "units": [UnitRange-подобные dict-ы]}}.
+
+        Это единственный источник, по которому считается обратный вклад:
+        `bsl_code_units` хранит и build-time контекст (`routine_name`,
+        `owner_qn`, `module_type`, `module_kind`, `rel_path`, `body_hash`), и
+        границы окон (`char_start/char_end/line_start/line_end/part_index/
+        part_total`). Пересчитывать разбиение через `split_routine` нельзя: оно
+        зависит от доступности tree-sitter/SDBL в момент вызова, а она не
+        входит в config fingerprint.
+
+        `bsl_code_phase_a_routine_state.body_hash` добавляется как
+        дополнительная сверка ТОЛЬКО там, где строка существует: у
+        закоммиченной эпохи `commit_pending` эти строки удаляет, поэтому их
+        отсутствие не является признаком дрейфа.
+        """
+        epoch = int(epoch)
+        out: Dict[str, Dict[str, Any]] = {}
+        with self._lock:
+            rows = self._conn.execute(
+                self._SERVING_UNIT_COLUMNS
+                + "WHERE project_name = ? AND config_name = ? AND index_epoch = ? "
+                + "ORDER BY routine_id, part_index",
+                (scope, config_name, epoch),
+            ).fetchall()
+            progress = {
+                r["routine_id"]: r["body_hash"]
+                for r in self._conn.execute(
+                    "SELECT routine_id, body_hash FROM bsl_code_phase_a_routine_state "
+                    "WHERE project_name = ? AND index_epoch = ?",
+                    (scope, epoch),
+                ).fetchall()
+            }
+        self._assemble_serving_entries(rows, progress, out)
+        return out
+
+    # Колонки serving-разбиения. Один список на оба публичных чтения, чтобы
+    # формат entry не разъехался между ними.
+    _SERVING_UNIT_COLUMNS = (
+        "SELECT routine_id, routine_name, owner_qn, module_type, "
+        "       module_kind, rel_path, body_hash, unit_id, "
+        "       char_start, char_end, line_start, line_end, "
+        "       part_index, part_total "
+        "FROM bsl_code_units "
+    )
+
+    @staticmethod
+    def _assemble_serving_entries(
+        rows: Iterable[Any],
+        progress: Dict[str, Any],
+        out: Dict[str, Dict[str, Any]],
+    ) -> None:
+        """Сборка строк `bsl_code_units` в entry-структуру serving-разбиения."""
+        for r in rows:
+            rid = r["routine_id"]
+            entry = out.get(rid)
+            if entry is None:
+                entry = {
+                    "routine_id": rid,
+                    "routine_name": r["routine_name"] or "",
+                    "owner_qn": r["owner_qn"] or "",
+                    "module_type": r["module_type"] or "",
+                    "module_kind": r["module_kind"] or "",
+                    "rel_path": r["rel_path"] or "",
+                    "body_hash": r["body_hash"] or "",
+                    "progress_body_hash": progress.get(rid),
+                    "units": [],
+                }
+                out[rid] = entry
+            entry["units"].append({
+                "unit_id": r["unit_id"],
+                "char_start": int(r["char_start"] or 0),
+                "char_end": int(r["char_end"] or 0),
+                "line_start": int(r["line_start"] or 0),
+                "line_end": int(r["line_end"] or 0),
+                "part_index": int(r["part_index"] or 0),
+                "part_total": int(r["part_total"] or 0),
+            })
+
+    def list_serving_routines_by_ids(
+        self, scope: str, epoch: int, routine_ids: Iterable[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """То же serving-разбиение, что `list_config_serving_routines`, но
+        отобранное по множеству `routine_id`, а не по конфигурации.
+
+        Нужно scoped-снапшоту шага 4.5: обратный вклад изменившихся/удалённых
+        routine обязан считаться по ТЕМ ЖЕ границам, по которым он добавлялся,
+        а `split_routine` пересчитать их не может — он не является чистой
+        функцией от (body, strategy).
+
+        Отсутствие routine в результате — законный случай (тело было пустым или
+        split не удался), он означает нулевой вклад, а не повреждение.
+        """
+        epoch = int(epoch)
+        ids = [str(rid) for rid in routine_ids if rid]
+        out: Dict[str, Dict[str, Any]] = {}
+        if not ids:
+            return out
+        # Чанкование под лимит переменных SQLite (SQLITE_MAX_VARIABLE_NUMBER);
+        # два параметра занимает scope+epoch.
+        chunk_size = 400
+        with self._lock:
+            for start in range(0, len(ids), chunk_size):
+                chunk = ids[start: start + chunk_size]
+                placeholders = ",".join("?" * len(chunk))
+                rows = self._conn.execute(
+                    self._SERVING_UNIT_COLUMNS
+                    + "WHERE project_name = ? AND index_epoch = ? "
+                    + f"  AND routine_id IN ({placeholders}) "
+                    + "ORDER BY routine_id, part_index",
+                    (scope, epoch, *chunk),
+                ).fetchall()
+                progress = {
+                    r["routine_id"]: r["body_hash"]
+                    for r in self._conn.execute(
+                        "SELECT routine_id, body_hash "
+                        "FROM bsl_code_phase_a_routine_state "
+                        "WHERE project_name = ? AND index_epoch = ? "
+                        f"  AND routine_id IN ({placeholders})",
+                        (scope, epoch, *chunk),
+                    ).fetchall()
+                }
+                self._assemble_serving_entries(rows, progress, out)
+        return out
+
+    def config_has_serving_rows(
+        self, scope: str, epoch: int, config_name: str,
+    ) -> bool:
+        """Есть ли у конфигурации хоть что-то в serving epoch (units/methods/modules)."""
+        epoch = int(epoch)
+        with self._lock:
+            for table in ("bsl_code_units", "bsl_code_methods", "bsl_code_modules"):
+                row = self._conn.execute(
+                    f"SELECT 1 FROM {table} "
+                    "WHERE project_name = ? AND config_name = ? AND index_epoch = ? "
+                    "LIMIT 1",
+                    (scope, config_name, epoch),
+                ).fetchone()
+                if row is not None:
+                    return True
+        return False
+
+    def routine_ids_for_config_methods(
+        self, scope: str, epoch: int, config_name: str,
+    ) -> List[str]:
+        """Defensive-дополнение к serving-множеству: routine_id из methods.
+
+        Строка метода может пережить исчезновение units (см. `methods_residual`
+        в legacy purge), и такой routine обязан попасть в множество операции,
+        иначе residual оставит его строки.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT DISTINCT routine_id FROM bsl_code_methods "
+                "WHERE project_name = ? AND config_name = ? AND index_epoch = ?",
+                (scope, config_name, int(epoch)),
+            ).fetchall()
+        return [r[0] for r in rows if r[0]]
+
+    def write_config_delete_preparation(
+        self,
+        scope: str,
+        operation_id: str,
+        *,
+        config_name: str,
+        index_epoch: int,
+        vector_epoch: Optional[int],
+        fingerprint: str,
+        rel_paths: Iterable[str],
+        routines: Sequence[Dict[str, Any]],
+        graph_count: int,
+    ) -> None:
+        """Атомарно записать подготовку и поднять reader gate.
+
+        Одна транзакция на всё: строки операции + gate. Иначе существовало бы
+        состояние «снимок есть, а поиск ещё показывает удаляемое расширение»
+        или наоборот.
+
+        Idempotent replay того же `operation_id` разрешён, пока ни одна строка
+        не перешла в `sqlite_applied`: после первого применённого чанка
+        перезапись снимка означала бы потерю уже вычтенного вклада, поэтому
+        такая попытка — ошибка, а не «подготовим заново».
+        """
+        rel_paths_list = sorted({p for p in (rel_paths or ()) if p})
+        routine_ids = sorted({r["routine_id"] for r in routines})
+        now = int(time.time())
+        serving_count = sum(1 for r in routines if r.get("in_serving"))
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                applied = cur.execute(
+                    "SELECT count(*) FROM bsl_code_config_delete_routines "
+                    "WHERE project_name = ? AND operation_id = ? AND stage = ?",
+                    (scope, operation_id, "sqlite_applied"),
+                ).fetchone()[0]
+                if applied:
+                    raise BslCodeSqliteError(
+                        f"config delete {operation_id!r}: {applied} routine(s) "
+                        f"already applied; preparation cannot be rewritten"
+                    )
+                cur.execute(
+                    "DELETE FROM bsl_code_config_delete_routines "
+                    "WHERE project_name = ? AND operation_id = ?",
+                    (scope, operation_id),
+                )
+                cur.execute(
+                    "DELETE FROM bsl_code_config_delete_ops "
+                    "WHERE project_name = ? AND operation_id = ?",
+                    (scope, operation_id),
+                )
+                cur.execute(
+                    "INSERT INTO bsl_code_config_delete_ops("
+                    "project_name, operation_id, config_name, index_epoch, "
+                    "vector_epoch, fingerprint, rel_paths_json, serving_count, "
+                    "graph_count, state, created_at, updated_at"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        scope, operation_id, config_name, int(index_epoch),
+                        None if vector_epoch is None else int(vector_epoch),
+                        fingerprint or "",
+                        json.dumps(rel_paths_list, ensure_ascii=False),
+                        serving_count, int(graph_count), "prepared", now, now,
+                    ),
+                )
+                cur.executemany(
+                    "INSERT INTO bsl_code_config_delete_routines("
+                    "project_name, operation_id, routine_id, rel_path, "
+                    "in_serving, idf_json, stats_json, stage"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            scope, operation_id, r["routine_id"],
+                            r.get("rel_path") or "",
+                            1 if r.get("in_serving") else 0,
+                            r.get("idf_json") or "{}",
+                            r.get("stats_json") or "{}",
+                            "snapshot_written",
+                        )
+                        for r in routines
+                    ],
+                )
+                # Reader gate — в той же транзакции. Расширение перестаёт быть
+                # видимым до удаления графа, поэтому окна «граф пуст, SQLite
+                # ещё нет» не существует.
+                self._set_scoped_gate_in_tx(
+                    cur, scope, True,
+                    routine_ids=routine_ids, rel_paths=rel_paths_list,
+                    also_set_scoped_retry_pending=False,
+                    visibility_flip_done=True,
+                )
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
+    def read_config_delete_operation(
+        self, scope: str, operation_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Header + агрегаты строк одним чтением — вход валидации `ADOPTED`."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT operation_id, config_name, index_epoch, vector_epoch, "
+                "       fingerprint, rel_paths_json, serving_count, graph_count, "
+                "       state, fallback_reason, created_at, updated_at "
+                "FROM bsl_code_config_delete_ops "
+                "WHERE project_name = ? AND operation_id = ?",
+                (scope, operation_id),
+            ).fetchone()
+            if row is None:
+                return None
+            routine_rows = self._conn.execute(
+                "SELECT routine_id, rel_path, in_serving, stage "
+                "FROM bsl_code_config_delete_routines "
+                "WHERE project_name = ? AND operation_id = ?",
+                (scope, operation_id),
+            ).fetchall()
+        try:
+            rel_paths = set(json.loads(row["rel_paths_json"] or "[]") or [])
+        except Exception:
+            rel_paths = set()
+        stages: Dict[str, int] = {}
+        routine_ids: Set[str] = set()
+        pending_ids: Set[str] = set()
+        for r in routine_rows:
+            stages[r["stage"]] = stages.get(r["stage"], 0) + 1
+            routine_ids.add(r["routine_id"])
+            if r["stage"] != "sqlite_applied" and int(r["in_serving"] or 0):
+                pending_ids.add(r["routine_id"])
+        return {
+            "operation_id": row["operation_id"],
+            "config_name": row["config_name"],
+            "index_epoch": int(row["index_epoch"]),
+            "vector_epoch": row["vector_epoch"],
+            "fingerprint": row["fingerprint"] or "",
+            "rel_paths": rel_paths,
+            "serving_count": int(row["serving_count"] or 0),
+            "graph_count": int(row["graph_count"] or 0),
+            "state": row["state"],
+            "fallback_reason": row["fallback_reason"] or "",
+            "routine_ids": routine_ids,
+            "pending_serving_ids": pending_ids,
+            "stage_counts": stages,
+        }
+
+    def find_active_config_delete_operations(self, scope: str) -> List[Dict[str, Any]]:
+        """Операции, которые ещё владеют serving-состоянием проекта.
+
+        `fallback_rebuild_required` сюда НЕ входит: такая операция уже передала
+        владение восстановлением полному rebuild и не должна его блокировать.
+        """
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT operation_id, config_name, state FROM bsl_code_config_delete_ops "
+                "WHERE project_name = ? AND state IN ('prepared', 'committed') "
+                "ORDER BY created_at",
+                (scope,),
+            ).fetchall()
+        return [
+            {
+                "operation_id": r["operation_id"],
+                "config_name": r["config_name"],
+                "state": r["state"],
+            }
+            for r in rows
+        ]
+
+    def read_config_delete_snapshot(
+        self, scope: str, operation_id: str, routine_ids: Iterable[str],
+    ) -> Dict[str, Dict[str, Any]]:
+        """{routine_id: {"idf": ..., "stats": ...}} — форма `_invert_snapshot`."""
+        ids = list(routine_ids or ())
+        if not ids:
+            return {}
+        rows = []
+        with self._lock:
+            for start in range(0, len(ids), 500):
+                chunk = ids[start: start + 500]
+                placeholders = ",".join("?" * len(chunk))
+                rows.extend(self._conn.execute(
+                    f"SELECT routine_id, idf_json, stats_json "
+                    f"FROM bsl_code_config_delete_routines "
+                    f"WHERE project_name = ? AND operation_id = ? "
+                    f"  AND routine_id IN ({placeholders})",
+                    (scope, operation_id, *chunk),
+                ).fetchall())
+        result: Dict[str, Dict[str, Any]] = {}
+        for r in rows:
+            try:
+                idf = json.loads(r["idf_json"] or "{}")
+            except Exception:
+                idf = {}
+            try:
+                stats_raw = json.loads(r["stats_json"] or "{}")
+            except Exception:
+                stats_raw = {}
+            stats = {
+                fk: tuple(v) if isinstance(v, list) else v
+                for fk, v in stats_raw.items()
+            }
+            result[r["routine_id"]] = {"idf": idf, "stats": stats}
+        return result
+
+    def mark_config_delete_state(
+        self,
+        scope: str,
+        operation_id: str,
+        state: str,
+        *,
+        fallback_reason: str = "",
+    ) -> None:
+        with self._lock:
+            self._conn.execute(
+                "UPDATE bsl_code_config_delete_ops "
+                "SET state = ?, fallback_reason = ?, updated_at = ? "
+                "WHERE project_name = ? AND operation_id = ?",
+                (state, fallback_reason, int(time.time()), scope, operation_id),
+            )
+
+    def mark_config_delete_fallback_rebuild(
+        self, scope: str, operation_id: str, reason: str,
+    ) -> None:
+        """Передать восстановление полному rebuild — ОДНОЙ транзакцией.
+
+        Два отдельных autocommit-запроса здесь недопустимы: при частичном
+        успехе операция уже перестала давать `CONFIG_DELETE_IN_PROGRESS`
+        (значит, никто её не ждёт как активную), а обязательства перестроить
+        индекс ещё нет. Получается состояние без выхода — readiness
+        `SCOPED_RETRY` с поднятым gate, пустой ledger и epoch, которую сменить
+        уже некому.
+
+        Gate намеренно НЕ снимается: строки расширения ещё лежат в старой
+        epoch, и поиск не должен их показывать до публикации новой.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                cur.execute(
+                    "UPDATE bsl_code_config_delete_ops "
+                    "SET state = 'fallback_rebuild_required', fallback_reason = ?, "
+                    "    updated_at = ? "
+                    "WHERE project_name = ? AND operation_id = ?",
+                    (reason, int(time.time()), scope, operation_id),
+                )
+                self._request_reindex_in_tx(cur, scope)
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
+    def cancel_config_delete_operation(
+        self, scope: str, operation_id: str, *, release_gate: bool = True,
+    ) -> None:
+        """Удалить операцию и (по умолчанию) снять gate — одной транзакцией.
+
+        Отказ, если хоть одна строка уже `sqlite_applied`: после начала
+        вычитания отменять нечего — вклад назад не вернуть, и такое состояние
+        обязано идти по liveness-веткам, а не по отмене.
+
+        `release_gate=False` — для случая, когда gate обязан остаться поднятым
+        до публикации новой serving epoch (передача восстановления полному
+        rebuild).
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                applied = cur.execute(
+                    "SELECT count(*) FROM bsl_code_config_delete_routines "
+                    "WHERE project_name = ? AND operation_id = ? AND stage = ?",
+                    (scope, operation_id, "sqlite_applied"),
+                ).fetchone()[0]
+                if applied:
+                    raise BslCodeSqliteError(
+                        f"config delete {operation_id!r}: cannot cancel, "
+                        f"{applied} routine(s) already applied"
+                    )
+                cur.execute(
+                    "DELETE FROM bsl_code_config_delete_routines "
+                    "WHERE project_name = ? AND operation_id = ?",
+                    (scope, operation_id),
+                )
+                cur.execute(
+                    "DELETE FROM bsl_code_config_delete_ops "
+                    "WHERE project_name = ? AND operation_id = ?",
+                    (scope, operation_id),
+                )
+                if release_gate:
+                    self._set_scoped_gate_in_tx(cur, scope, False)
+                cur.execute("COMMIT")
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
+    def drop_config_delete_operation(
+        self, scope: str, operation_id: str, *, release_gate: bool = True,
+    ) -> None:
+        """Безусловно снять операцию — финализация или obsolete-после-rebuild.
+
+        В отличие от `cancel_config_delete_operation`, не проверяет стадии:
+        вызывается, когда вычитание либо уже полностью учтено, либо потеряло
+        смысл вместе со старой epoch.
+        """
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                cur.execute(
+                    "DELETE FROM bsl_code_config_delete_routines "
+                    "WHERE project_name = ? AND operation_id = ?",
+                    (scope, operation_id),
+                )
+                cur.execute(
+                    "DELETE FROM bsl_code_config_delete_ops "
+                    "WHERE project_name = ? AND operation_id = ?",
+                    (scope, operation_id),
+                )
+                if release_gate:
+                    self._set_scoped_gate_in_tx(cur, scope, False)
+                cur.execute("COMMIT")
             except Exception:
                 cur.execute("ROLLBACK")
                 raise
@@ -4170,6 +5305,12 @@ class BslCodeSqlite:
                     cur, scope, int(epoch), units, methods, done_routines, module_fragments,
                 )
                 self._upsert_idf_stats_in_tx(cur, scope, int(epoch), idf_increments, stats_increments)
+                # Итоговое состояние затронутых токенов: отрицательных быть не
+                # должно, нулевые — удалить. Проверяется ПОСЛЕ положительного
+                # upsert: внутри транзакции «минус, потом плюс» — норма.
+                self._settle_reverse_counters_in_tx(
+                    cur, scope, int(epoch), idf_reverse, stats_reverse,
+                )
                 self._clear_snapshot_in_tx(cur, scope, clear_snapshot_ids or ids)
                 if set_ledger_stage:
                     self._set_ledger_stage_in_tx(cur, scope, ids, set_ledger_stage)
@@ -4449,9 +5590,15 @@ class BslCodeSqlite:
     def delete_phase_b_state_by_routine_ids(
         self,
         scope: str,
-        vector_epoch: int,
+        vector_epoch: Optional[int],
         routine_ids: Iterable[str],
     ) -> int:
+        """`vector_epoch=None` — по ВСЕМ vector-эпохам.
+
+        Нужно физическому удалению конфигурации: routines исчезают навсегда, и
+        маркер про них не имеет смысла ни в одной эпохе, а перебирать эпохи
+        снаружи означало бы знать их список.
+        """
         ids = list(routine_ids or ())
         if not ids:
             return 0
@@ -4461,14 +5608,157 @@ class BslCodeSqlite:
             for start in range(0, len(ids), 500):
                 chunk = ids[start: start + 500]
                 placeholders = ",".join("?" * len(chunk))
-                cur.execute(
-                    f"DELETE FROM bsl_code_phase_b_unit_state "
-                    f"WHERE project_name = ? AND vector_epoch = ? "
-                    f"AND routine_id IN ({placeholders})",
-                    (scope, int(vector_epoch), *chunk),
-                )
+                if vector_epoch is None:
+                    cur.execute(
+                        f"DELETE FROM bsl_code_phase_b_unit_state "
+                        f"WHERE project_name = ? "
+                        f"AND routine_id IN ({placeholders})",
+                        (scope, *chunk),
+                    )
+                else:
+                    cur.execute(
+                        f"DELETE FROM bsl_code_phase_b_unit_state "
+                        f"WHERE project_name = ? AND vector_epoch = ? "
+                        f"AND routine_id IN ({placeholders})",
+                        (scope, int(vector_epoch), *chunk),
+                    )
                 total += cur.rowcount or 0
         return total
+
+    def finalize_config_delete_residuals(
+        self,
+        scope: str,
+        epoch: int,
+        config_name: str,
+        routine_ids: Iterable[str],
+        *,
+        operation_id: Optional[str] = None,
+        drop_operation: bool = True,
+    ) -> Dict[str, int]:
+        """Idempotent housekeeping после успешного вычитания.
+
+        НИКОГДА не трогает `bsl_code_corpus_idf`, `bsl_code_corpus_stats`,
+        `reindex_requested` и serving epoch — в этом весь смысл отдельной
+        стадии: падение после вычитания не должно приводить ко второму
+        вычитанию, поэтому повторяется только housekeeping.
+
+        Что снимается (то, чего не делает `_delete_phase_a_routine_in_tx`):
+        Phase A progress rows, Phase B markers во всех vector-эпохах, модули
+        конфигурации вместе с module FTS (включая ПУСТУЮ строку, которую
+        оставляет пересборка FTS для пути без фрагментов), residual methods.
+        """
+        epoch = int(epoch)
+        ids = sorted(set(routine_ids or ()))
+        stats: Dict[str, int] = {}
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("BEGIN")
+            try:
+                removed_phase_a = 0
+                for start in range(0, len(ids), 500):
+                    chunk = ids[start: start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    cur.execute(
+                        f"DELETE FROM bsl_code_phase_a_routine_state "
+                        f"WHERE project_name = ? AND index_epoch = ? "
+                        f"  AND routine_id IN ({placeholders})",
+                        (scope, epoch, *chunk),
+                    )
+                    removed_phase_a += cur.rowcount or 0
+                stats["phase_a_state"] = removed_phase_a
+
+                removed_phase_b = 0
+                for start in range(0, len(ids), 500):
+                    chunk = ids[start: start + 500]
+                    placeholders = ",".join("?" * len(chunk))
+                    cur.execute(
+                        f"DELETE FROM bsl_code_phase_b_unit_state "
+                        f"WHERE project_name = ? AND routine_id IN ({placeholders})",
+                        (scope, *chunk),
+                    )
+                    removed_phase_b += cur.rowcount or 0
+                stats["phase_b_state"] = removed_phase_b
+
+                stats["modules"] = self._delete_config_modules_and_fts_in_tx(
+                    cur, scope, epoch, config_name,
+                )
+                cur.execute(
+                    "DELETE FROM bsl_code_methods "
+                    "WHERE project_name = ? AND config_name = ? AND index_epoch = ?",
+                    (scope, config_name, epoch),
+                )
+                stats["methods_residual"] = max(0, cur.rowcount or 0)
+
+                for table in ("bsl_code_units", "bsl_code_methods", "bsl_code_modules"):
+                    left = cur.execute(
+                        f"SELECT count(*) FROM {table} "
+                        "WHERE project_name = ? AND config_name = ? AND index_epoch = ?",
+                        (scope, config_name, epoch),
+                    ).fetchone()[0]
+                    if left:
+                        raise BslCodeSqliteError(
+                            f"config delete residuals: {left} row(s) of config "
+                            f"{config_name!r} remain in {table}"
+                        )
+
+                if operation_id and drop_operation:
+                    cur.execute(
+                        "DELETE FROM bsl_code_config_delete_routines "
+                        "WHERE project_name = ? AND operation_id = ?",
+                        (scope, operation_id),
+                    )
+                    cur.execute(
+                        "DELETE FROM bsl_code_config_delete_ops "
+                        "WHERE project_name = ? AND operation_id = ?",
+                        (scope, operation_id),
+                    )
+                cur.execute("COMMIT")
+                return stats
+            except Exception:
+                cur.execute("ROLLBACK")
+                raise
+
+    def recover_config_delete_operation_disabled(
+        self,
+        scope: str,
+        operation_id: str,
+        config_name: str,
+        epoch: int,
+    ) -> Dict[str, Any]:
+        """Teardown операции при выключенном BSL — одной транзакцией.
+
+        Ситуация: процесс перезапустили с `ENABLE_BSL_CODE_SEARCH=false`, а
+        операция уже пересекла destructive-границу. Bundle не поднимается, но
+        оставить строки операции и поднятый gate нельзя: gate переживёт даже
+        последующий полный rebuild (`commit_pending` его не трогает), а
+        `classify_delta_readiness` будет вечно видеть активную операцию.
+
+        Ветвление по состоянию:
+        - `committed`/`residual_done` — counters уже вычтены корректно, значит
+          достаточно housekeeping без `reindex_requested`: согласованный индекс
+          не должен платить полной перестройкой при повторном включении BSL;
+        - иначе — legacy purge с обязательством перестроить. Точное довычитание
+          здесь ничего не покупает: при выключенном BSL sidecar никого не
+          обслуживает, а `source_state_hash` уже разошёлся с графом, поэтому
+          при включении rebuild всё равно неизбежен.
+        """
+        epoch = int(epoch)
+        header = self.read_config_delete_operation(scope, operation_id)
+        state = (header or {}).get("state") or ""
+        ids = sorted((header or {}).get("routine_ids") or ())
+        if state in ("committed", "residual_done"):
+            stats = self.finalize_config_delete_residuals(
+                scope, epoch, config_name, ids,
+                operation_id=operation_id, drop_operation=True,
+            )
+            with self._lock:
+                self._ensure_fingerprint_row(scope)
+                self._set_scoped_gate_in_tx(self._conn, scope, False, ensure_row=False)
+            return {"mode": "residual_only", "reindex_requested": 0, **stats}
+
+        stats = self.purge_config_and_request_reindex(scope, epoch, config_name)
+        self.drop_config_delete_operation(scope, operation_id, release_gate=True)
+        return {"mode": "legacy_purge", **stats}
 
     def delete_phase_b_state_for_epoch(
         self,
@@ -4612,3 +5902,25 @@ def get_bsl_code_sqlite(db_path: Optional[str] = None) -> BslCodeSqlite:
             inst = BslCodeSqlite(db_path=path)
             _INSTANCES[path] = inst
         return inst
+
+
+def open_existing_bsl_sidecar(db_path: Optional[str] = None) -> Optional[BslCodeSqlite]:
+    """Открыть УЖЕ существующий sidecar; не создавать файл и схему.
+
+    Нужен единственному потребителю — teardown config-delete операции при
+    выключенном `ENABLE_BSL_CODE_SEARCH`. Обычная фабрика там недопустима:
+    она материализовала бы пустой sidecar для выключенной подсистемы, и
+    позднее включение доверилось бы этому ready-state (та же причина, по
+    которой `purge_config_scope` проверяет существование файла до
+    инстанцирования).
+
+    Возвращает `None`, если файла нет — закрывать нечего.
+    """
+    try:
+        resolved = Path(db_path or settings.bsl_code_search_sqlite_path)
+    except Exception:  # noqa: BLE001
+        logger.exception("open_existing_bsl_sidecar: sqlite path unavailable")
+        return None
+    if not resolved.exists():
+        return None
+    return get_bsl_code_sqlite(str(resolved))

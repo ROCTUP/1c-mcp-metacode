@@ -163,7 +163,7 @@ def _vector_index_state(session, index_name: str) -> Optional[str]:
     return record["state"]
 
 
-def wait_vector_index_online(
+def wait_index_online(
     session,
     index_name: str,
     timeout_seconds: float,
@@ -174,9 +174,12 @@ def wait_vector_index_online(
     """Poll SHOW INDEXES until `index_name` reaches state 'ONLINE' or timeout.
 
     Returns True iff the index reached ONLINE within `timeout_seconds`.
-    A newly (re)created vector index is not queryable until it finishes
-    populating; committing vector_status='ready' before ONLINE would expose a
-    search path whose vector query can fail/be unstable.
+    A newly (re)created index is not queryable until it finishes populating;
+    declaring a search capability ready before ONLINE would expose a path that is
+    still unindexed (or, for vector indexes, whose query can fail/be unstable).
+
+    Index-type agnostic: `SHOW INDEXES YIELD name, state` covers RANGE, TEXT and
+    VECTOR alike.
 
     `sleep_fn(seconds)` lets callers inject a heartbeat-aware sleep (keeps a
     scheduler lease alive); defaults to time.sleep.
@@ -197,6 +200,170 @@ def wait_vector_index_online(
             )
             return False
         sleeper(min(poll_interval_seconds, max(0.0, deadline - time.monotonic())))
+
+
+def wait_vector_index_online(
+    session,
+    index_name: str,
+    timeout_seconds: float,
+    *,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+    poll_interval_seconds: float = 2.0,
+) -> bool:
+    """Vector-index alias of `wait_index_online` (kept for existing call sites)."""
+    return wait_index_online(
+        session, index_name, timeout_seconds,
+        sleep_fn=sleep_fn, poll_interval_seconds=poll_interval_seconds,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Routine search schema: denormalized *_norm fields + their index.
+# ---------------------------------------------------------------------------
+
+# Bumped when the backfill contract changes; the marker node stores the applied version.
+ROUTINE_SEARCH_SCHEMA_VERSION: int = 1
+ROUTINE_SEARCH_SCHEMA_KEY: str = "routine_search_fields"
+IDX_ROUTINE_NAME_NORM: str = "idx_routine_name_norm"
+
+_ROUTINE_NORM_BACKFILL = """
+CALL {
+  MATCH (r:Routine) WHERE r.name_norm IS NULL
+  SET r.name_norm      = toLower(coalesce(r.name, '')),
+      r.signature_norm = toLower(coalesce(r.signature, ''))
+} IN TRANSACTIONS OF 10000 ROWS
+"""
+
+# Substring-search accelerators. Unlike the correctness schema above these are optional:
+# a missing or POPULATING index only means the matching `contains` query runs as a scan,
+# exactly as it does today. They are listed here rather than in the generic index list of
+# create_indexes() so one owner can both create them and verify their state — the generic
+# loop swallows per-statement DDL errors, which would let a capability report itself ready
+# while a candidate driver is absent.
+ROUTINE_SEARCH_ACCELERATORS: Dict[str, str] = {
+    "ftx_routine_name": (
+        "CREATE FULLTEXT INDEX ftx_routine_name IF NOT EXISTS "
+        "FOR (r:Routine) ON EACH [r.name]"
+    ),
+    "ftx_routine_signature": (
+        "CREATE FULLTEXT INDEX ftx_routine_signature IF NOT EXISTS "
+        "FOR (r:Routine) ON EACH [r.signature]"
+    ),
+    # Ordered page source for the modes with no selective name predicate (unused,
+    # exported, description fallback). Column order matters: the query orders by
+    # (project_name, name, id), and only a matching index prefix lets the planner stream
+    # rows instead of materialising every match.
+    "idx_routine_proj_name": (
+        "CREATE INDEX idx_routine_proj_name IF NOT EXISTS "
+        "FOR (r:Routine) ON (r.project_name, r.name)"
+    ),
+}
+
+
+def online_accelerator_indexes(session, names) -> set:
+    """Names among `names` whose index currently exists and is ONLINE."""
+    rows = session.run(
+        "SHOW INDEXES YIELD name, state WHERE name IN $names AND state = 'ONLINE' "
+        "RETURN name",
+        names=list(names),
+    )
+    return {r["name"] for r in rows}
+
+
+def ensure_accelerator_index(
+    session,
+    index_name: str,
+    *,
+    online_timeout_seconds: float = 1800.0,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+) -> bool:
+    """Create one substring accelerator and wait for it to come ONLINE.
+
+    Returns True iff the index is queryable. Failure is not an error condition for the
+    caller: the corresponding search simply keeps using the scan path.
+
+    The timeout is generous because populating a fulltext index over every Routine takes
+    minutes on large configurations; nothing waits on this call, so a long wait costs
+    only the background thread.
+    """
+    ddl = ROUTINE_SEARCH_ACCELERATORS.get(index_name)
+    if ddl is None:
+        raise ValueError(f"Unknown routine search accelerator: {index_name}")
+    try:
+        session.run(ddl)
+    except Neo4jError as e:
+        logger.warning("Could not create accelerator index %s: %s", index_name, e)
+        return False
+    if not wait_index_online(
+        session, index_name, online_timeout_seconds, sleep_fn=sleep_fn,
+    ):
+        logger.warning("Accelerator index %s did not reach ONLINE", index_name)
+        return False
+    logger.info("Accelerator index %s is ONLINE", index_name)
+    return True
+
+
+def _routine_schema_version(session) -> int:
+    record = session.run(
+        "MATCH (s:GraphSchemaState {key: $key}) RETURN s.version AS version",
+        key=ROUTINE_SEARCH_SCHEMA_KEY,
+    ).single()
+    if not record or record["version"] is None:
+        return 0
+    return int(record["version"])
+
+
+def ensure_routine_search_schema(
+    session,
+    *,
+    online_timeout_seconds: float = 300.0,
+    sleep_fn: Optional[Callable[[float], None]] = None,
+) -> bool:
+    """Make Routine name search usable: backfill `*_norm`, create the index, wait ONLINE.
+
+    Three stages, and the capability is ready only after all three:
+
+    1. data     — batched backfill, guarded by a :GraphSchemaState marker. Idempotent and
+                  restartable via `WHERE r.name_norm IS NULL`; the marker is written only
+                  after the backfill completes.
+    2. schema   — index DDL. Unlike the generic create_indexes() loop this does NOT swallow
+                  errors: a missing index leaves the search path working but slow, which is
+                  exactly the symptom this schema exists to remove.
+    3. readiness— poll until ONLINE. Fields plus a POPULATING index are not ready.
+
+    The marker covers stage 1 only; stages 2-3 are re-verified on every call (a cheap
+    SHOW INDEXES by name) so a crash between backfill and DDL cannot produce false readiness.
+
+    Returns True iff the capability is ready. Raises nothing — failures are reported
+    via the return value and logged.
+    """
+    try:
+        if _routine_schema_version(session) < ROUTINE_SEARCH_SCHEMA_VERSION:
+            logger.info("Routine search schema: backfilling name_norm/signature_norm")
+            session.run(_ROUTINE_NORM_BACKFILL)
+            session.run(
+                "MERGE (s:GraphSchemaState {key: $key}) SET s.version = $version",
+                key=ROUTINE_SEARCH_SCHEMA_KEY, version=ROUTINE_SEARCH_SCHEMA_VERSION,
+            )
+            logger.info("Routine search schema: backfill complete")
+
+        session.run(
+            f"CREATE INDEX {IDX_ROUTINE_NAME_NORM} IF NOT EXISTS "
+            "FOR (r:Routine) ON (r.name_norm)"
+        )
+    except Neo4jError as e:
+        logger.error("Routine search schema not ready: %s", e)
+        return False
+
+    if not wait_index_online(
+        session, IDX_ROUTINE_NAME_NORM, online_timeout_seconds, sleep_fn=sleep_fn,
+    ):
+        logger.error(
+            "Routine search schema not ready: index %s did not reach ONLINE",
+            IDX_ROUTINE_NAME_NORM,
+        )
+        return False
+    return True
 
 
 def ensure_bsl_code_vector_index_online(
@@ -479,7 +646,9 @@ class IndexManagementMixin:
                 "CREATE FULLTEXT INDEX ftx_accountingflag_name IF NOT EXISTS FOR (af:AccountingFlag) ON EACH [af.name]",
                 "CREATE FULLTEXT INDEX ftx_dimensionaccountingflag_name IF NOT EXISTS FOR (sf:DimensionAccountingFlag) ON EACH [sf.name]",
                 "CREATE FULLTEXT INDEX ftx_predefineditem_name IF NOT EXISTS FOR (p:PredefinedItem) ON EACH [p.name]",
-                "CREATE FULLTEXT INDEX ftx_routine_name IF NOT EXISTS FOR (r:Routine) ON EACH [r.name]",
+                # ftx_routine_name lives in ROUTINE_SEARCH_ACCELERATORS: substring search
+                # depends on it, so it needs an owner that also verifies its state, and
+                # this loop only logs DDL failures.
                 "CREATE FULLTEXT INDEX ftx_routine_directives IF NOT EXISTS FOR (r:Routine) ON EACH [r.directives]",
                 "CREATE FULLTEXT INDEX ftx_routine_doc_description IF NOT EXISTS FOR (r:Routine) ON EACH [r.doc_description] OPTIONS { indexConfig: { `fulltext.analyzer`: 'russian', `fulltext.eventually_consistent`: true } }",
                 "CREATE FULLTEXT INDEX ftx_metadataobject_description IF NOT EXISTS FOR (m:MetadataObject) ON EACH [m.name, m.`Синоним`, m.`Комментарий`, m.`Справка`, m.`Пояснение`] OPTIONS { indexConfig: { `fulltext.analyzer`: 'russian', `fulltext.eventually_consistent`: true } }",
@@ -528,6 +697,10 @@ class IndexManagementMixin:
             # If an old unique constraint on (m.name) exists from previous versions,
             # it should be dropped manually.
             logger.info("Database indexes and constraints ensured")
+
+            # Routine search schema owns its own DDL + readiness (see ensure_routine_search_schema):
+            # it must not go through the error-swallowing loop above.
+            ensure_routine_search_schema(session)
 
         # Create vector indexes if embeddings are enabled
         self.create_vector_indexes(use_startup_probe=use_startup_probe_for_vectors)

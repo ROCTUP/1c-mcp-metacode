@@ -8,12 +8,70 @@ apply_changed_object / apply_deleted_object orchestration.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from config import settings
 from .cypher_templates import cypher_role_rights_grants_access_to
 
 logger = logging.getLogger(__name__)
+
+
+# Канонический identity-предикат extension scope. Используется одинаково в
+# discovery-скане, batch-delete и verification — иначе verification проверял бы
+# не то, что удаляли.
+#
+# Самостоятельной ветки `n.config_name = $config_name` здесь НЕТ намеренно:
+# одна Neo4j-БД может держать несколько проектов (ради этого существует
+# `clear_project`), а одноимённые типовые конфигурации 1С в разных проектах —
+# норма. Внутренности форм создаются с `config_name`, но без `project_name`
+# (form_xml_parser кладёт только config_name), поэтому голая ветка по имени
+# снесла бы чужой проект. Их ловит prefix-ветка: QN строится от `{project}/{config}/`.
+_SCOPE_IDENTITY_PREDICATE = (
+    "    (n.project_name = $project_name AND n.config_name = $config_name)\n"
+    " OR n.qualified_name = $config_qn\n"
+    " OR (n.qualified_name IS NOT NULL AND n.qualified_name STARTS WITH $prefix)\n"
+    " OR n.owner_qn = $config_qn\n"
+    " OR (n.owner_qn IS NOT NULL AND n.owner_qn STARTS WITH $prefix)"
+)
+
+
+class ExtensionScopeCleanupIncomplete(RuntimeError):
+    """Verification после удаления scope нашла остаток.
+
+    Бросается вместо тихого продолжения: stage машины cleanup обязана оставить
+    запись очереди на retry, а не объявить удаление успешным.
+    """
+
+    def __init__(self, config_qn: str, remaining_by_label: Dict[str, int]) -> None:
+        self.config_qn = config_qn
+        self.remaining_by_label = dict(remaining_by_label)
+        total = sum(remaining_by_label.values())
+        super().__init__(
+            f"extension scope {config_qn!r} still has {total} node(s) after cleanup: "
+            f"{remaining_by_label}"
+        )
+
+
+@dataclass
+class ConfigScopeCleanupStats:
+    """Результат `delete_configuration_scope` — для отчёта и логов."""
+
+    total_deleted: int = 0
+    deleted_by_label: Dict[str, int] = field(default_factory=dict)
+    labels_discovered: List[str] = field(default_factory=list)
+    batches: int = 0
+    legacy_orphans_by_label: Dict[str, int] = field(default_factory=dict)
+
+
+def _escape_label(label: str) -> str:
+    """Обернуть label в backticks для подстановки в Cypher.
+
+    Label берётся из самого графа (`labels(n)`), а не из пользовательского
+    ввода, но экранирование всё равно обязательно: имена меток могут содержать
+    backtick, и без удвоения запрос сломался бы.
+    """
+    return "`" + label.replace("`", "``") + "`"
 
 
 # Whitelist меток metadata-owned children (Architectural decision 1).
@@ -522,6 +580,156 @@ class IncrementalLoaderMixin:
                 if deleted < bs:
                     break
         return total
+
+    # ------------------------------------------------------------------
+    # delete_configuration_scope — config-level аналог delete_object_subtree
+    # ------------------------------------------------------------------
+
+    def delete_configuration_scope(
+        self,
+        project_name: str,
+        config_name: str,
+        config_qn: str,
+        batch_size: Optional[int] = None,
+        lease: Optional[Any] = None,
+    ) -> ConfigScopeCleanupStats:
+        """Физически снести все узлы конфигурации (расширения) по identity.
+
+        Три шага:
+
+        1. discovery-скан — какие labels реально присутствуют в scope. Список
+           берётся из графа, а не из константы, поэтому новый тип узла не
+           требует правки кода (в отличие от прежнего `_EXT_CHILD_LABELS`);
+        2. батчевое `DETACH DELETE` по каждому найденному label. Именно
+           per-label, а не label-free `MATCH (n)` в цикле: последний давал бы
+           полный скан на каждой итерации, то есть O(N x batches);
+        3. verification тем же предикатом; остаток → `ExtensionScopeCleanupIncomplete`.
+
+        Traversal по рёбрам от `Configuration` использовать нельзя: `EXTENDS`,
+        `ADOPTED_FROM`, `EXTENDS_MODULE`, `EXTENDS_ROUTINE`, `EXTENDS_ACTION`,
+        `CALLS` уходят в базовую конфигурацию и увели бы удаление в базу.
+
+        Исключения не проглатываются — вызывающая stage-машина обязана увидеть
+        сбой и сохранить запись очереди для retry.
+        """
+        if not self.driver:
+            raise RuntimeError("Neo4j driver is not initialized")
+        if not config_name or not config_qn:
+            raise ValueError("delete_configuration_scope requires config_name and config_qn")
+
+        bs = max(1, int(batch_size or settings.neo4j_clear_project_batch_size))
+        params = {
+            "project_name": project_name,
+            "config_name": config_name,
+            "config_qn": config_qn,
+            # Трейлинг-слэш обязателен: отделяет `Config$ext$Ext1/` от
+            # `Config$ext$Ext1Suffix/`.
+            "prefix": config_qn + "/",
+        }
+        stats = ConfigScopeCleanupStats()
+
+        def _heartbeat() -> None:
+            if lease is not None:
+                try:
+                    lease.heartbeat()
+                except Exception:  # noqa: BLE001
+                    logger.debug("delete_configuration_scope: lease heartbeat failed")
+
+        with self.driver.session(database=settings.neo4j_database) as session:
+            # 1. Discovery. UNWIND labels(n), а не labels(n)[0]: у узла может
+            # быть несколько меток (RoutineCodeUnit:BslCodeSearchUnit,
+            # :ConsoleSearchable), и брать первую попавшуюся значило бы
+            # надеяться на порядок.
+            discovered = session.run(
+                f"MATCH (n)\nWHERE {_SCOPE_IDENTITY_PREDICATE}\n"
+                "UNWIND labels(n) AS label\n"
+                "RETURN label, count(*) AS cnt\n"
+                "ORDER BY label",
+                **params,
+            ).values()
+            labels = [row[0] for row in discovered]
+            stats.labels_discovered = list(labels)
+            if not labels:
+                logger.info(
+                    "delete_configuration_scope: nothing to delete for %s", config_qn
+                )
+                return stats
+
+            logger.info(
+                "delete_configuration_scope: %s — %d label(s) to clean: %s",
+                config_qn,
+                len(labels),
+                ", ".join(f"{row[0]}={row[1]}" for row in discovered),
+            )
+            _heartbeat()
+
+            # 2. Батчевое удаление по каждому обнаруженному label.
+            for label in labels:
+                cypher = (
+                    f"MATCH (n:{_escape_label(label)})\n"
+                    f"WHERE {_SCOPE_IDENTITY_PREDICATE}\n"
+                    "WITH n LIMIT $batch_size\n"
+                    "DETACH DELETE n\n"
+                    "RETURN count(n) AS deleted"
+                )
+                label_total = 0
+                while True:
+                    rec = session.run(cypher, batch_size=bs, **params).single()
+                    deleted = int(rec["deleted"]) if rec else 0
+                    label_total += deleted
+                    stats.total_deleted += deleted
+                    stats.batches += 1
+                    _heartbeat()
+                    if deleted < bs:
+                        break
+                    logger.info(
+                        "delete_configuration_scope: %s/%s — %d deleted so far",
+                        config_qn, label, label_total,
+                    )
+                if label_total:
+                    stats.deleted_by_label[label] = label_total
+
+            # 3. Verification тем же предикатом.
+            remaining = session.run(
+                f"MATCH (n)\nWHERE {_SCOPE_IDENTITY_PREDICATE}\n"
+                "UNWIND labels(n) AS label\n"
+                "RETURN label, count(*) AS cnt",
+                **params,
+            ).values()
+            if remaining:
+                raise ExtensionScopeCleanupIncomplete(
+                    config_qn, {row[0]: int(row[1]) for row in remaining}
+                )
+
+            # 4. Audit осиротевших legacy-узлов: `config_name` есть, а никакой
+            # project-идентичности нет. Отнести их к проекту нельзя, поэтому
+            # только диагностика — удалять по имени значило бы рисковать чужим
+            # проектом.
+            orphans = session.run(
+                "MATCH (n)\n"
+                "WHERE n.config_name = $config_name\n"
+                "  AND n.project_name IS NULL\n"
+                "  AND n.qualified_name IS NULL\n"
+                "  AND n.owner_qn IS NULL\n"
+                "UNWIND labels(n) AS label\n"
+                "RETURN label, count(*) AS cnt",
+                config_name=config_name,
+            ).values()
+            if orphans:
+                stats.legacy_orphans_by_label = {row[0]: int(row[1]) for row in orphans}
+                logger.warning(
+                    "delete_configuration_scope: %s — %d legacy node(s) carry config_name "
+                    "without any project identity and were NOT deleted: %s",
+                    config_qn,
+                    sum(stats.legacy_orphans_by_label.values()),
+                    stats.legacy_orphans_by_label,
+                )
+
+        logger.info(
+            "delete_configuration_scope: %s — deleted %d node(s) in %d batch(es): %s",
+            config_qn, stats.total_deleted, stats.batches, stats.deleted_by_label,
+        )
+        return stats
 
     # ------------------------------------------------------------------
     # delete_metadata_object_node + empty category cleanup

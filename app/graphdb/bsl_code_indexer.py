@@ -44,7 +44,7 @@ import re
 import time
 from collections import Counter
 from pathlib import PurePosixPath
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from config import settings
 from runtime_memory import trim_process_memory
@@ -78,6 +78,7 @@ from .cypher_templates import (
     CYPHER_DELETE_BSL_LARGE_PENDING_OVERLAP_BATCH,
     CYPHER_DELETE_BSL_LARGE_UNITS_STALE_BATCH,
     CYPHER_FETCH_ROUTINE_BODY_BATCH,
+    CYPHER_FETCH_ROUTINE_IDS_FOR_CONFIG,
     CYPHER_FETCH_ROUTINE_RECORDS_BY_IDS,
     CYPHER_FETCH_ROUTINES_BODY_BATCH,
     CYPHER_FETCH_ROUTINES_LIGHTWEIGHT,
@@ -1786,6 +1787,19 @@ class BslCodeSearchIndexer:
                 finally:
                     if profiler is not None and debug_start is not None:
                         profiler.add_submit(debug_start)
+                # Адрес пакета до отправки: main знает его состав, поэтому
+                # последняя такая строка перед остановкой прогресса прямо
+                # указывает на подозреваемые модули.
+                if logger.isEnabledFor(logging.DEBUG):
+                    first_path = (pack_records[0].get("file_path") or "").strip()
+                    last_path = (pack_records[-1].get("file_path") or "").strip()
+                    logger.debug(
+                        "BSL Phase A: submitted pack routines=%d chars=%d "
+                        "rel_path=%s..%s",
+                        len(pack_records),
+                        sum(len(r.get("body") or "") for r in pack_records),
+                        first_path, last_path,
+                    )
                 pending_futures.append(fut)
                 # Backpressure: while we have many in-flight pending futures
                 # blocking a result lets main keep up and bounds RAM.
@@ -3502,6 +3516,33 @@ class BslCodeSearchIndexer:
                     if rid:
                         result[rid] = self._inject_owner_qn_parsed_fields(r)
         return result
+
+    def _fetch_routine_ids_for_config(
+        self, scope: str, config_name: str, *, lease: Optional[Any] = None,
+    ) -> Set[str]:
+        """Все Routine id конфигурации из графа.
+
+        Множество шире serving-множества sidecar: routines с пустым телом и
+        исключённые политикой BSL в `bsl_code_units` не попадают. Нужно для
+        двух вещей — доказать `serving_ids ⊆ graph_ids` (иначе в индексе есть
+        routine, чей исходный вклад восстановить неоткуда) и снять их
+        progress-строки в residual без остатка.
+        """
+        out: Set[str] = set()
+        with self.driver.session(database=settings.neo4j_database) as session:
+            result = session.run(
+                CYPHER_FETCH_ROUTINE_IDS_FOR_CONFIG,
+                project_name=scope,
+                config_name=config_name,
+            )
+            for rec in result:
+                rid = rec.get("routine_id")
+                if rid:
+                    out.add(rid)
+                if len(out) % 5000 == 0:
+                    _safe_heartbeat(lease)
+        _safe_heartbeat(lease)
+        return out
 
     def _fetch_routines_lightweight_by_ids(
         self, scope: str, routine_ids: Iterable[str],

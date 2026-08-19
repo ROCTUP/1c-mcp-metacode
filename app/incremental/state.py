@@ -22,6 +22,7 @@ import logging
 import os
 import sqlite3
 import time
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Set, Tuple
@@ -178,7 +179,83 @@ CREATE TABLE IF NOT EXISTS ext_analyzer_outputs (
     payload_json   TEXT NOT NULL,
     PRIMARY KEY (project_name, source_scope, rel_path, label, qualified_name, output_kind, property_key)
 );
+
+CREATE TABLE IF NOT EXISTS extension_scope_cleanup (
+    project_name   TEXT NOT NULL,
+    source_scope   TEXT NOT NULL,
+    config_qn      TEXT NOT NULL,
+    source_mode    TEXT NOT NULL,
+    ext_dir_name   TEXT NOT NULL,
+    config_name    TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    stage          TEXT NOT NULL,
+    graph_mutation_started INTEGER NOT NULL DEFAULT 0,
+    graph_refresh_required INTEGER NOT NULL DEFAULT 0,
+    confirmations  INTEGER NOT NULL DEFAULT 1,
+    attempts       INTEGER NOT NULL DEFAULT 0,
+    last_error     TEXT,
+    discovered_at  INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL,
+    -- Идентичность BSL-операции удаления. Генерируется ОДИН раз при INSERT и
+    -- переживает повторный enqueue: именно поэтому durable-подготовку можно
+    -- писать в BSL SQLite раньше incremental-состояния — retry придёт с тем же
+    -- id и усыновит её. Пустое значение = строка создана версией без scoped
+    -- удаления, для неё действует прежний legacy-маршрут.
+    cleanup_uid    TEXT NOT NULL DEFAULT '',
+    bsl_mode       TEXT NOT NULL DEFAULT '',
+    bsl_fallback_reason TEXT NOT NULL DEFAULT '',
+    PRIMARY KEY (project_name, source_scope, config_qn)
+);
 """
+
+# Стадии cleanup — монотонные, назад не откатываются.
+CLEANUP_STAGE_DISCOVERED = "discovered"
+CLEANUP_STAGE_BSL_DELETE_PREPARED = "bsl_delete_prepared"
+CLEANUP_STAGE_GRAPH_DELETED = "graph_deleted"
+CLEANUP_STAGE_SUMMARIES_QUARANTINED = "summaries_quarantined"
+CLEANUP_STAGE_BSL_DELTA_APPLIED = "bsl_delta_applied"
+CLEANUP_STAGE_BSL_PURGED = "bsl_purged"
+CLEANUP_STAGE_FINALIZED = "finalized"
+
+# Порядок важен: `_stage_rank` сравнивает по индексу, чтобы upsert не понижал
+# уже достигнутую стадию. Quarantine стоит ДО BSL сознательно — файловая стадия
+# ни от чего не зависит, а BSL-стадия единственная может законно отложиться.
+#
+# `bsl_delete_prepared` стоит ДО graph delete: durable-снимок обратного вклада
+# обязан существовать раньше, чем исчезнет граф, иначе восстановить вклад
+# будет неоткуда. `bsl_delta_applied` — после quarantine, вместе с прежним
+# `bsl_purged` (тот сохраняет имя и позицию, чтобы уже выпущенные строки
+# очереди финализировались без спецкода; legacy-строки просто перепрыгивают
+# новые стадии — сравнение по рангу это допускает).
+CLEANUP_STAGE_ORDER: Tuple[str, ...] = (
+    CLEANUP_STAGE_DISCOVERED,
+    CLEANUP_STAGE_BSL_DELETE_PREPARED,
+    CLEANUP_STAGE_GRAPH_DELETED,
+    CLEANUP_STAGE_SUMMARIES_QUARANTINED,
+    CLEANUP_STAGE_BSL_DELTA_APPLIED,
+    CLEANUP_STAGE_BSL_PURGED,
+    CLEANUP_STAGE_FINALIZED,
+)
+
+# Режимы BSL-стадии для отчёта и диагностики.
+CLEANUP_BSL_MODE_SCOPED_DELTA = "scoped_delta"
+CLEANUP_BSL_MODE_ABSENT = "absent"
+CLEANUP_BSL_MODE_DISABLED = "disabled"
+CLEANUP_BSL_MODE_LEGACY_PURGE = "legacy_purge"
+CLEANUP_BSL_MODE_DEFERRED = "deferred"
+CLEANUP_BSL_MODE_FULL_REBUILD_RECOVERY = "full_rebuild_recovery"
+
+CLEANUP_REASON_DIRECTORY_REMOVED = "directory_removed"
+CLEANUP_REASON_STRUCTURE_INVALID = "structure_invalid"
+CLEANUP_REASON_CONFIGURATION_RENAMED = "configuration_renamed"
+
+
+def cleanup_stage_rank(stage: str) -> int:
+    """Порядковый номер стадии; неизвестная стадия — -1 (ниже любой известной)."""
+    try:
+        return CLEANUP_STAGE_ORDER.index(stage)
+    except ValueError:
+        return -1
 
 
 class IncrementalLoadingState:
@@ -211,8 +288,27 @@ class IncrementalLoadingState:
         conn.execute("PRAGMA foreign_keys=ON;")
         conn.executescript(_SCHEMA_SQL)
         self._migrate_metadata_object_hashes(conn)
+        self._migrate_extension_scope_cleanup(conn)
         self._conn = conn
         return conn
+
+    @staticmethod
+    def _migrate_extension_scope_cleanup(conn: sqlite3.Connection) -> None:
+        """Догнать колонки очереди в уже существующей БД.
+
+        `CREATE TABLE IF NOT EXISTS` существующую таблицу не обновляет, поэтому
+        без явного `ALTER TABLE` строки очереди старой версии не получили бы ни
+        `cleanup_uid`, ни полей режима. Пустой `cleanup_uid` при этом —
+        осмысленное значение: он и есть признак «строка создана версией без
+        scoped удаления».
+        """
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(extension_scope_cleanup)")}
+        for name in ("cleanup_uid", "bsl_mode", "bsl_fallback_reason"):
+            if name not in cols:
+                conn.execute(
+                    f"ALTER TABLE extension_scope_cleanup "
+                    f"ADD COLUMN {name} TEXT NOT NULL DEFAULT ''"
+                )
 
     @staticmethod
     def _migrate_metadata_object_hashes(conn: sqlite3.Connection) -> None:
@@ -969,74 +1065,125 @@ class IncrementalLoadingState:
         ).fetchone()
         return row[0] if row else None
 
-    def delete_scope(self, source_scope: str) -> None:
+    def delete_scope(self, source_scope: str) -> Dict[str, int]:
         """Снести весь state одного scope (используется при удалении каталога
         расширения и при rename конфигурации внутри `<ext_dir>`).
 
         Удаляет rows из всех per-scope таблиц по `source_type = source_scope`.
         `scheduler_lock` не трогаем — он не per-project/per-scope.
+        `extension_scope_cleanup` тоже НЕ трогаем: строка очереди — это retry
+        identity, её снимает координатор после перехода в `finalized`.
+
+        Всё выполняется одной транзакцией: частично снесённый state оставил бы
+        scope в состоянии, из которого следующий цикл не может ни продолжить,
+        ни корректно переинициализироваться.
+
+        Возвращает число удалённых строк по таблицам — для отчёта и тестов.
+        """
+        params = (self.project_name, source_scope)
+        deleted: Dict[str, int] = {}
+
+        def _run(conn: sqlite3.Connection, table: str, sql: str, args: Tuple) -> None:
+            cur = conn.execute(sql, args)
+            if cur.rowcount and cur.rowcount > 0:
+                deleted[table] = deleted.get(table, 0) + cur.rowcount
+
+        with self.transaction() as conn:
+            _run(conn, "stage_state",
+                 "DELETE FROM stage_state WHERE project_name=? AND source_type=?", params)
+            _run(conn, "metadata_object_hashes",
+                 "DELETE FROM metadata_object_hashes WHERE project_name=? AND source_type=?",
+                 params)
+            _run(conn, "configuration_state",
+                 "DELETE FROM configuration_state WHERE project_name=? AND source_type=?",
+                 params)
+            _run(conn, "form_property_keys",
+                 "DELETE FROM form_property_keys WHERE project_name=? AND source_type=?",
+                 params)
+            _run(conn, "command_property_keys",
+                 "DELETE FROM command_property_keys WHERE project_name=? AND source_type=?",
+                 params)
+            _run(conn, "source_manifest",
+                 "DELETE FROM source_manifest WHERE project_name=? AND source_type=?",
+                 params)
+            # Artifact state расширения снимается по prefix `artifact:ext:*:<ext_dir>:*`.
+            # Извлекаем `<ext_dir>` из phase 1 source_scope: txt_ext:<dir> / xml_ext:<dir>.
+            if ":" in source_scope:
+                mode_dir = source_scope.split(":", 1)
+                scope_kind = mode_dir[0]
+                ext_dir = mode_dir[1] if len(mode_dir) > 1 else ""
+                if scope_kind in ("txt_ext", "xml_ext") and ext_dir:
+                    mode = "txt" if scope_kind == "txt_ext" else "xml"
+                    artifact_prefix = f"artifact:ext:{mode}:{ext_dir}:"
+                    like_pattern = escape_like(artifact_prefix) + "%"
+                    _run(conn, "artifact_manifest",
+                         "DELETE FROM artifact_manifest "
+                         "WHERE project_name=? AND source_scope LIKE ? ESCAPE '\\'",
+                         (self.project_name, like_pattern))
+                    _run(conn, "bsl_file_artifacts",
+                         "DELETE FROM bsl_file_artifacts "
+                         "WHERE project_name=? AND source_scope LIKE ? ESCAPE '\\'",
+                         (self.project_name, like_pattern))
+                    # Отложенный BSL-дифф того же scope. Без этого удаления он
+                    # пережил бы cleanup и был бы переигран на новом поколении,
+                    # воскресив сигнатуры удалённой конфигурации.
+                    _run(conn, "bsl_deferred_changes",
+                         "DELETE FROM bsl_deferred_changes "
+                         "WHERE project_name=? AND source_scope LIKE ? ESCAPE '\\'",
+                         (self.project_name, like_pattern))
+                    # guid_state и file-manifest для GUID — exact-scope, без LIKE.
+                    guid_scope = f"guid_ext:{mode}:{ext_dir}"
+                    _run(conn, "guid_state",
+                         "DELETE FROM guid_state WHERE project_name=? AND scope=?",
+                         (self.project_name, guid_scope))
+                    _run(conn, "source_manifest",
+                         "DELETE FROM source_manifest "
+                         "WHERE project_name=? AND source_type='guid' AND rel_path=?",
+                         (self.project_name, guid_scope))
+                    # ext_analyzer_outputs — exact scope артефакта property_analysis.
+                    pa_scope = f"artifact:ext:{mode}:{ext_dir}:property_analysis"
+                    _run(conn, "ext_analyzer_outputs",
+                         "DELETE FROM ext_analyzer_outputs "
+                         "WHERE project_name=? AND source_scope=?",
+                         (self.project_name, pa_scope))
+        return deleted
+
+    def scope_has_any_state(self, source_scope: str) -> bool:
+        """Остались ли активные строки scope после `delete_scope`.
+
+        Используется координатором как verification перед финализацией: очередь
+        не должна помечаться завершённой, пока в state что-то живо.
         """
         conn = self._connect()
         params = (self.project_name, source_scope)
-        conn.execute(
-            "DELETE FROM stage_state WHERE project_name=? AND source_type=?", params
-        )
-        conn.execute(
-            "DELETE FROM metadata_object_hashes WHERE project_name=? AND source_type=?",
-            params,
-        )
-        conn.execute(
-            "DELETE FROM configuration_state WHERE project_name=? AND source_type=?",
-            params,
-        )
-        conn.execute(
-            "DELETE FROM form_property_keys WHERE project_name=? AND source_type=?", params
-        )
-        conn.execute(
-            "DELETE FROM command_property_keys WHERE project_name=? AND source_type=?",
-            params,
-        )
-        conn.execute(
-            "DELETE FROM source_manifest WHERE project_name=? AND source_type=?", params
-        )
-        # Artifact state расширения снимается по prefix `artifact:ext:*:<ext_dir>:*`.
-        # Извлекаем `<ext_dir>` из phase 1 source_scope: txt_ext:<dir> / xml_ext:<dir>.
+        for table in (
+            "stage_state",
+            "metadata_object_hashes",
+            "configuration_state",
+            "form_property_keys",
+            "command_property_keys",
+            "source_manifest",
+        ):
+            row = conn.execute(
+                f"SELECT 1 FROM {table} WHERE project_name=? AND source_type=? LIMIT 1",
+                params,
+            ).fetchone()
+            if row:
+                return True
         if ":" in source_scope:
-            mode_dir = source_scope.split(":", 1)
-            scope_kind = mode_dir[0]
-            ext_dir = mode_dir[1] if len(mode_dir) > 1 else ""
+            scope_kind, _, ext_dir = source_scope.partition(":")
             if scope_kind in ("txt_ext", "xml_ext") and ext_dir:
                 mode = "txt" if scope_kind == "txt_ext" else "xml"
-                artifact_prefix = f"artifact:ext:{mode}:{ext_dir}:"
-                like_pattern = escape_like(artifact_prefix) + "%"
-                conn.execute(
-                    "DELETE FROM artifact_manifest "
-                    "WHERE project_name=? AND source_scope LIKE ? ESCAPE '\\'",
-                    (self.project_name, like_pattern),
-                )
-                conn.execute(
-                    "DELETE FROM bsl_file_artifacts "
-                    "WHERE project_name=? AND source_scope LIKE ? ESCAPE '\\'",
-                    (self.project_name, like_pattern),
-                )
-                # guid_state и file-manifest для GUID — exact-scope, без LIKE.
-                guid_scope = f"guid_ext:{mode}:{ext_dir}"
-                conn.execute(
-                    "DELETE FROM guid_state WHERE project_name=? AND scope=?",
-                    (self.project_name, guid_scope),
-                )
-                conn.execute(
-                    "DELETE FROM source_manifest "
-                    "WHERE project_name=? AND source_type='guid' AND rel_path=?",
-                    (self.project_name, guid_scope),
-                )
-                # ext_analyzer_outputs — exact scope артефакта property_analysis.
-                pa_scope = f"artifact:ext:{mode}:{ext_dir}:property_analysis"
-                conn.execute(
-                    "DELETE FROM ext_analyzer_outputs "
-                    "WHERE project_name=? AND source_scope=?",
-                    (self.project_name, pa_scope),
-                )
+                like_pattern = escape_like(f"artifact:ext:{mode}:{ext_dir}:") + "%"
+                for table in ("artifact_manifest", "bsl_file_artifacts", "bsl_deferred_changes"):
+                    row = conn.execute(
+                        f"SELECT 1 FROM {table} "
+                        "WHERE project_name=? AND source_scope LIKE ? ESCAPE '\\' LIMIT 1",
+                        (self.project_name, like_pattern),
+                    ).fetchone()
+                    if row:
+                        return True
+        return False
 
     # ------------------------------------------------------------------
     # Baseline reset after full reload
@@ -1054,9 +1201,206 @@ class IncrementalLoadingState:
         conn.execute("DELETE FROM source_manifest WHERE project_name=?", params)
         conn.execute("DELETE FROM artifact_manifest WHERE project_name=?", params)
         conn.execute("DELETE FROM bsl_file_artifacts WHERE project_name=?", params)
+        conn.execute("DELETE FROM bsl_deferred_changes WHERE project_name=?", params)
         conn.execute("DELETE FROM guid_state WHERE project_name=?", params)
         conn.execute("DELETE FROM ext_analyzer_outputs WHERE project_name=?", params)
+        # Очередь cleanup тоже снимается: full reload перестраивает граф целиком,
+        # поэтому незавершённые удаления отдельных scope теряют смысл — их работу
+        # выполняет сам reload.
+        conn.execute("DELETE FROM extension_scope_cleanup WHERE project_name=?", params)
         # scheduler_lock не трогаем — он не per-project.
+
+    # ------------------------------------------------------------------
+    # extension_scope_cleanup — durable-очередь удаления extension scope
+    # ------------------------------------------------------------------
+
+    def enqueue_extension_cleanup(
+        self,
+        *,
+        source_scope: str,
+        config_qn: str,
+        source_mode: str,
+        ext_dir_name: str,
+        config_name: str,
+        reason: str,
+    ) -> int:
+        """Поставить scope в очередь на удаление (idempotent upsert).
+
+        Повторный enqueue той же identity поднимает `confirmations` — на этом
+        построено требование второго подтверждения для `structure_invalid`, —
+        но НЕ понижает достигнутую стадию, НЕ сбрасывает durable-флаги и НЕ
+        перевыпускает `cleanup_uid`: идентичность BSL-операции обязана быть
+        стабильной, иначе retry не смог бы усыновить уже записанную подготовку.
+
+        Возвращает текущее значение `confirmations`.
+        """
+        now = int(time.time())
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT stage, confirmations FROM extension_scope_cleanup "
+                "WHERE project_name=? AND source_scope=? AND config_qn=?",
+                (self.project_name, source_scope, config_qn),
+            ).fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO extension_scope_cleanup("
+                    " project_name, source_scope, config_qn, source_mode, ext_dir_name,"
+                    " config_name, reason, stage, confirmations, discovered_at, updated_at,"
+                    " cleanup_uid"
+                    ") VALUES (?,?,?,?,?,?,?,?,1,?,?,?)",
+                    (
+                        self.project_name, source_scope, config_qn, source_mode,
+                        ext_dir_name, config_name, reason,
+                        CLEANUP_STAGE_DISCOVERED, now, now,
+                        uuid.uuid4().hex,
+                    ),
+                )
+                return 1
+            confirmations = int(row[1] or 0) + 1
+            conn.execute(
+                "UPDATE extension_scope_cleanup "
+                "SET confirmations=?, reason=?, updated_at=? "
+                "WHERE project_name=? AND source_scope=? AND config_qn=?",
+                (confirmations, reason, now, self.project_name, source_scope, config_qn),
+            )
+            return confirmations
+
+    def list_pending_extension_cleanups(self) -> List[Dict[str, Any]]:
+        """Все нефинализированные записи очереди, старые первыми."""
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT source_scope, config_qn, source_mode, ext_dir_name, config_name,"
+            "       reason, stage, graph_mutation_started, graph_refresh_required,"
+            "       confirmations, attempts, last_error, discovered_at, updated_at,"
+            "       cleanup_uid, bsl_mode, bsl_fallback_reason "
+            "FROM extension_scope_cleanup "
+            "WHERE project_name=? AND stage != ? "
+            "ORDER BY discovered_at, source_scope, config_qn",
+            (self.project_name, CLEANUP_STAGE_FINALIZED),
+        ).fetchall()
+        keys = (
+            "source_scope", "config_qn", "source_mode", "ext_dir_name", "config_name",
+            "reason", "stage", "graph_mutation_started", "graph_refresh_required",
+            "confirmations", "attempts", "last_error", "discovered_at", "updated_at",
+            "cleanup_uid", "bsl_mode", "bsl_fallback_reason",
+        )
+        return [dict(zip(keys, r)) for r in rows]
+
+    def list_pending_cleanup_scopes(self) -> Set[str]:
+        """`source_scope` всех нефинализированных записей.
+
+        Единый источник блокировки для всех фаз цикла. `delete_scope` бьёт по
+        `source_scope`, а не по `config_qn`, поэтому пока запись жива, scope
+        нельзя загружать ни одной фазой — иначе отложенная финализация снесёт
+        baseline уже нового поколения, а artifact phase успеет воссоздать узлы
+        старого под уже отработавшей стадией `graph_deleted`.
+        """
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT DISTINCT source_scope FROM extension_scope_cleanup "
+            "WHERE project_name=? AND stage != ?",
+            (self.project_name, CLEANUP_STAGE_FINALIZED),
+        ).fetchall()
+        return {r[0] for r in rows}
+
+    def mark_extension_cleanup_graph_mutation_started(
+        self, source_scope: str, config_qn: str
+    ) -> None:
+        """Выставить оба durable-флага одной транзакцией ДО первого DETACH DELETE.
+
+        `graph_mutation_started` — признак пересечения destructive-границы, на
+        нём построен stage-aware guard: после него вернувшийся каталог уже не
+        отменяет saga, её нужно доводить до конца.
+
+        `graph_refresh_required` — сигнал downstream-потребителю (кэш статистики
+        Web Console). Точный счётчик удалённых узлов живёт только в памяти
+        цикла, поэтому retry после падения между батчами увидел бы zero-delete
+        и финализировал бы cleanup без обновления кэша.
+
+        Оба выставляются ДО удаления, а не после: первый батч может упасть, и
+        запись «мы уже начали ломать граф» обязана это пережить.
+        """
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE extension_scope_cleanup "
+                "SET graph_mutation_started=1, graph_refresh_required=1, updated_at=? "
+                "WHERE project_name=? AND source_scope=? AND config_qn=?",
+                (int(time.time()), self.project_name, source_scope, config_qn),
+            )
+
+    def advance_extension_cleanup_stage(
+        self, source_scope: str, config_qn: str, stage: str
+    ) -> None:
+        """Продвинуть стадию, если новая строго выше достигнутой.
+
+        Монотонность — не косметика: она гарантирует, что уже выполненная
+        destructive-операция не повторится после рестарта.
+        """
+        rank = cleanup_stage_rank(stage)
+        if rank < 0:
+            raise ValueError(f"unknown cleanup stage: {stage!r}")
+        with self.transaction() as conn:
+            row = conn.execute(
+                "SELECT stage FROM extension_scope_cleanup "
+                "WHERE project_name=? AND source_scope=? AND config_qn=?",
+                (self.project_name, source_scope, config_qn),
+            ).fetchone()
+            if row is None or cleanup_stage_rank(row[0]) >= rank:
+                return
+            conn.execute(
+                "UPDATE extension_scope_cleanup SET stage=?, last_error=NULL, updated_at=? "
+                "WHERE project_name=? AND source_scope=? AND config_qn=?",
+                (stage, int(time.time()), self.project_name, source_scope, config_qn),
+            )
+
+    def record_extension_cleanup_bsl_mode(
+        self,
+        source_scope: str,
+        config_qn: str,
+        bsl_mode: str,
+        *,
+        fallback_reason: str = "",
+    ) -> None:
+        """Зафиксировать выбранный BSL-маршрут и причину отката.
+
+        Отдельно от стадии: стадия говорит «докуда дошли», режим — «каким
+        путём». Пустой `fallback_reason` при legacy-режиме недопустим по
+        контракту отчёта: полная перестройка корпуса обязана иметь объяснение.
+        """
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE extension_scope_cleanup "
+                "SET bsl_mode=?, bsl_fallback_reason=?, updated_at=? "
+                "WHERE project_name=? AND source_scope=? AND config_qn=?",
+                (
+                    bsl_mode, fallback_reason, int(time.time()),
+                    self.project_name, source_scope, config_qn,
+                ),
+            )
+
+    def record_extension_cleanup_error(
+        self, source_scope: str, config_qn: str, error: str
+    ) -> None:
+        """Зафиксировать сбой стадии: attempts++ и текст ошибки.
+
+        Запись очереди при этом сохраняется — она и есть retry identity.
+        """
+        with self.transaction() as conn:
+            conn.execute(
+                "UPDATE extension_scope_cleanup "
+                "SET attempts=attempts+1, last_error=?, updated_at=? "
+                "WHERE project_name=? AND source_scope=? AND config_qn=?",
+                (error[:2000], int(time.time()), self.project_name, source_scope, config_qn),
+            )
+
+    def delete_extension_cleanup(self, source_scope: str, config_qn: str) -> None:
+        """Снять запись очереди (финализация или supersede)."""
+        with self.transaction() as conn:
+            conn.execute(
+                "DELETE FROM extension_scope_cleanup "
+                "WHERE project_name=? AND source_scope=? AND config_qn=?",
+                (self.project_name, source_scope, config_qn),
+            )
 
     # ------------------------------------------------------------------
     # artifact_manifest — per-file state артефактов (Form.xml/.bsl/Predefined/Help/...)
